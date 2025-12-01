@@ -482,9 +482,10 @@ class EATMINTDataset(Dataset):
         self.window_samples = int(window_size_sec * target_fs)
         
         # Filter to usable participants
-        self.participants = availability_df[
-            (availability_df['n_modalities'] >= min_modalities) &
-            (availability_df['times'])
+        self.participants = availability_df
+        self.participants = self.participants[
+            (self.participants['n_modalities'] >= min_modalities) &
+            (self.participants['times'])
         ].reset_index(drop=True)
         
         # Build index of all windows
@@ -1175,8 +1176,16 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
+    mask_physio_submodality: bool = True,
 ) -> Dict[str, float]:
-    """Train for one epoch."""
+    """
+    Train for one epoch.
+
+    If mask_physio_submodality is True, one physio sub-modality (channel)
+    is randomly zeroed in the input for the whole batch, so the model
+    must reconstruct it from the remaining physio channels and the other
+    modalities.
+    """
     model.train()
     
     total_loss = 0.0
@@ -1190,16 +1199,27 @@ def train_epoch(
         
         optimizer.zero_grad()
         
-        # Forward pass
+        # Optionally mask one physio sub-modality in the input
+        physio_input = batch['physio']
+        if mask_physio_submodality and physio_input is not None:
+            # Choose a random physio channel to drop for this batch
+            n_channels = physio_input.shape[-1]
+            drop_idx = torch.randint(0, n_channels, (1,), device=device).item()
+            physio_masked = physio_input.clone()
+            physio_masked[:, :, drop_idx] = 0.0
+        else:
+            physio_masked = physio_input
+        
+        # Forward pass with masked physio input
         outputs = model(
             audio=batch['audio'],
-            physio=batch['physio'],
+            physio=physio_masked,
             openface=batch['openface'],
             eyetracker=batch['eyetracker'],
             modality_mask=batch['modality_mask'],
         )
         
-        # Compute loss
+        # Compute loss against full targets (including the dropped physio channel)
         loss, losses = compute_masked_loss(
             outputs,
             {k: batch[k] for k in ['audio', 'physio', 'openface', 'eyetracker']},
@@ -1253,7 +1273,8 @@ def train(
     for epoch in range(n_epochs):
         print(f"\nEpoch {epoch + 1}/{n_epochs}")
         
-        metrics = train_epoch(model, dataloader, optimizer, device)
+        # Train with physio sub-modality masking enabled
+        metrics = train_epoch(model, dataloader, optimizer, device, mask_physio_submodality=True)
         scheduler.step()
         
         history.append(metrics)
@@ -1285,7 +1306,7 @@ def visualize_reconstruction(
     device: str = 'cpu',
     save_path: Optional[str] = None,
 ):
-    """Visualize original vs reconstructed signals."""
+    """Visualize original vs reconstructed signals for all high-level modalities."""
     model.eval()
     
     sample = dataset[sample_idx]
@@ -1327,6 +1348,88 @@ def visualize_reconstruction(
         ax_orig.legend(loc='upper right', fontsize=8)
         ax_recon.legend(loc='upper right', fontsize=8)
     
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+    
+    plt.show()
+
+
+def visualize_physio_cross_reconstruction(
+    model: nn.Module,
+    dataset: Dataset,
+    sample_idx: int = 0,
+    device: str = 'cpu',
+    save_path: Optional[str] = None,
+):
+    """
+    Visualize cross-reconstruction of individual physio sub-modalities.
+
+    For a given sample, we remove one physio channel at a time from the input
+    (set to zero) and let the model reconstruct it from the remaining
+    physio channels and the other modalities. We then plot original vs
+    reconstructed for all physio sub-modalities.
+    """
+    model.eval()
+
+    # Try to ensure we pick a sample that actually has physio
+    if sample_idx < 0 or sample_idx >= len(dataset):
+        sample_idx = 0
+
+    sample = dataset[sample_idx]
+    if sample['modality_mask'][1].item() == 0:
+        found = False
+        for i in range(len(dataset)):
+            s = dataset[i]
+            if s['modality_mask'][1].item() == 1:
+                sample = s
+                sample_idx = i
+                found = True
+                break
+        if not found:
+            print("No sample with physio modality available for visualization.")
+            return
+
+    print(f"Using sample index {sample_idx} for physio cross-reconstruction visualization.")
+    
+    # Prepare batch (1, seq, ...)
+    batch = {k: v.unsqueeze(0).to(device) for k, v in sample.items()}
+    
+    n_physio = batch['physio'].shape[-1]
+    physio_names = EATMINTDataset.PHYSIO_SIGNALS
+    
+    fig, axes = plt.subplots(n_physio, 1, figsize=(14, 2.5 * n_physio), sharex=True)
+    if n_physio == 1:
+        axes = [axes]
+    
+    with torch.no_grad():
+        for idx in range(n_physio):
+            # Mask one physio sub-modality
+            physio_masked = batch['physio'].clone()
+            physio_masked[:, :, idx] = 0.0
+            
+            outputs = model(
+                audio=batch['audio'],
+                physio=physio_masked,
+                openface=batch['openface'],
+                eyetracker=batch['eyetracker'],
+                modality_mask=batch['modality_mask'],
+            )
+            
+            recon = outputs['physio'][0, :, idx].detach().cpu().numpy()
+            original = batch['physio'][0, :, idx].detach().cpu().numpy()
+            
+            ax = axes[idx]
+            ax.plot(original, label='Original', alpha=0.7)
+            ax.plot(recon, label='Reconstructed', alpha=0.7, linestyle='--')
+            name = physio_names[idx] if idx < len(physio_names) else f'Channel {idx}'
+            ax.set_title(f'Physio sub-modality: {name}')
+            ax.legend(loc='upper right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+    
+    axes[-1].set_xlabel('Time (samples)')
     plt.tight_layout()
     
     if save_path:
@@ -1410,7 +1513,7 @@ def main():
     print(f"\nUsing device: {device}")
     
     # Initialize audio feature extractor (only if no precomputed features)
-    audio_extractor = None
+    audio_extractor = None    # Always pass availability_df (even if we use usable_df for debug above)
     if not use_precomputed:
         print("\nLoading Wav2Vec2 audio encoder (for on-the-fly extraction)...")
         audio_extractor = AudioFeatureExtractor(
@@ -1481,9 +1584,17 @@ def main():
     # Plot results
     plot_training_history(history, save_path="training_history.png")
     
-    # Visualize reconstruction
-    visualize_reconstruction(model, dataset, sample_idx=0, device=device, 
-                            save_path="reconstruction.png")
+    # Visualize reconstruction of all high-level modalities
+    visualize_reconstruction(
+        model, dataset, sample_idx=0, device=device,
+        save_path="reconstruction.png"
+    )
+    
+    # Visualize physio sub-modality cross-reconstruction (5 physio signals)
+    visualize_physio_cross_reconstruction(
+        model, dataset, sample_idx=0, device=device,
+        save_path="physio_cross_reconstruction.png"
+    )
     
     print("\nDone!")
 
