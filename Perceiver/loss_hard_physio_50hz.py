@@ -1,154 +1,146 @@
-"""Physio-pooled Perceiver variant with advanced physio-only masking.
+"""Physio-centered training variant that downsamples physio streams to 50 Hz.
 
-This script keeps the high-resolution physio stream (~500 Hz) all the way into
-the model (via :mod:`physiopooled_eatmint_multimodal_perceiver`) and applies a
-set of structured masking augmentations exclusively to the physio modality.
-The masking policy mixes channel dropout, temporal span dropout, and mild
-Gaussian noise, encouraging the model to compress physio signals while relying
-on the other modalities for reconstruction.
+This script mirrors ``loss_hard_physio.py`` but removes the dedicated
+high-resolution convolutional encoder/decoder. Instead, it performs a simple
+average-pooling downsampling from 500 Hz to 50 Hz (with optional smoothing) so
+all modalities are aligned on the same temporal grid. The goal is to simplify
+physio reconstruction and allow the Perceiver to focus on inter-physio
+relationships without the added complexity of the temporal conv stack.
 
 Usage:
-    python physiopooled_masked_physio.py
+    python loss_hard_physio_50hz.py
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from scipy import signal
+
 from eatmint_multimodal_perceiver import (
     AudioFeatureExtractor,
     EATMINTConfig,
     EATMINTDataset,
+    EATMINTPerceiver,
     check_modality_availability,
     compute_masked_loss,
     plot_training_history,
     print_availability_summary,
     visualize_reconstruction,
 )
-from physiopooled_eatmint_multimodal_perceiver import (
-    PhysioPooledEATMINTDataset,
-    PhysioPooledEATMINTPerceiver,
+from physiopooled_eatmint_multimodal_perceiver import PhysioPooledEATMINTDataset
+
+from loss_hard_physio import (
+    PhysioMasker,
+    PhysioMaskingConfig,
+    PhysioLossWeightConfig,
+    PhysioLossWeightScheduler,
 )
 
 
 # =============================================================================
-# Physio masking policy
+# Dataset helper
 # =============================================================================
 
 
-@dataclass
-class PhysioMaskingConfig:
-    """Configuration for the physio-only masking policy."""
+class Physio50HzDataset(PhysioPooledEATMINTDataset):
+    """Downsample high-rate physio tokens to 50 Hz with low-pass polyphase filtering."""
 
-    channel_drop_prob: float = 0.2
-    min_channels_to_drop: int = 0
-    max_channels_to_drop: int = 2
-    temporal_mask_prob: float = 0.85
-    min_temporal_span_ratio: float = 0.05
-    max_temporal_span_ratio: float = 0.25
-    max_temporal_masks: int = 3
-    temporal_mask_band_prob: float = 0.4
-    noise_std: float = 0.01
-    min_severity: float = 0.4
-    max_severity: float = 1.0
-    schedule: str = "cosine"  # cosine progression across epochs
-
-
-class PhysioMasker:
-    """Applies structured masks to physio tokens before they enter the model."""
-
-    def __init__(self, config: PhysioMaskingConfig) -> None:
-        self.config = config
-        self._severity = config.max_severity
-
-    def update_progress(self, progress: float) -> None:
-        progress = float(min(max(progress, 0.0), 1.0))
-        if self.config.schedule == "cosine":
-            scaled = 0.5 - 0.5 * math.cos(math.pi * progress)
-        elif self.config.schedule == "linear":
-            scaled = progress
-        else:
-            scaled = 1.0
-        span = max(self.config.max_severity - self.config.min_severity, 1e-3)
-        self._severity = self.config.min_severity + span * scaled
-
-    def __call__(
+    def __init__(
         self,
-        physio: torch.Tensor,
-        physio_available: torch.Tensor,
-    ) -> tuple[torch.Tensor, float]:
-        if physio is None:
-            return physio, 0.0
+        *args,
+        smoothing_kernel: int = 0,
+        downsample_strategy: str = "polyphase",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.smoothing_kernel = max(0, smoothing_kernel)
+        self.downsample_strategy = downsample_strategy
 
-        masked = physio.clone()
-        total_masked = 0
-        total_tokens = 0
-        available_indices = torch.nonzero(physio_available.bool(), as_tuple=False).flatten()
+        frac = Fraction(int(round(self.target_fs)), int(round(self.physio_target_fs)))
+        self._poly_up = frac.numerator
+        self._poly_down = frac.denominator
 
-        for idx in available_indices:
-            seq = masked[idx]
-            seq_masked, masked_count = self._mask_single(seq)
-            masked[idx] = seq_masked
-            total_masked += masked_count
-            total_tokens += seq.numel()
+    def _polyphase_downsample(self, physio: torch.Tensor) -> torch.Tensor:
+        arr = physio.detach().cpu().numpy().astype(np.float32)
+        resampled = signal.resample_poly(arr, self._poly_up, self._poly_down, axis=0, padtype="mean")
+        return torch.from_numpy(resampled).to(physio.device)
 
-        ratio = float(total_masked) / float(total_tokens) if total_tokens > 0 else 0.0
-        return masked, ratio
+    def _avg_downsample(self, physio: torch.Tensor) -> torch.Tensor:
+        x = physio.transpose(0, 1).unsqueeze(0)
+        pooled = F.avg_pool1d(
+            x,
+            kernel_size=self.physio_downsample_factor,
+            stride=self.physio_downsample_factor,
+            ceil_mode=False,
+        )
+        pooled = pooled.squeeze(0).transpose(0, 1)
+        return pooled
 
-    def _mask_single(self, seq: torch.Tensor) -> tuple[torch.Tensor, int]:
-        seq_len, n_channels = seq.shape
-        mask = torch.zeros(seq_len, n_channels, dtype=torch.bool, device=seq.device)
-        result = seq.clone()
+    def _smooth(self, physio: torch.Tensor) -> torch.Tensor:
+        if self.smoothing_kernel <= 1:
+            return physio
+        kernel = torch.ones(
+            physio.size(1),
+            1,
+            self.smoothing_kernel,
+            device=physio.device,
+            dtype=physio.dtype,
+        )
+        kernel = kernel / float(self.smoothing_kernel)
+        padded = self.smoothing_kernel // 2
+        return (
+            F.conv1d(
+                physio.transpose(0, 1).unsqueeze(0),
+                kernel,
+                padding=padded,
+                groups=physio.size(1),
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
 
-        # Channel dropout
-        drop_prob = self.config.channel_drop_prob * self._severity
-        if n_channels > 0 and torch.rand(1, device=seq.device).item() < drop_prob:
-            max_drop = min(n_channels, self.config.max_channels_to_drop)
-            min_drop = min(max_drop, self.config.min_channels_to_drop)
-            if max_drop > 0 and min_drop > 0:
-                drop_count = torch.randint(min_drop, max_drop + 1, (1,), device=seq.device).item()
-                drop_idx = torch.randperm(n_channels, device=seq.device)[:drop_count]
-                mask[:, drop_idx] = True
+    def _pool_physio(self, physio: torch.Tensor) -> torch.Tensor:
+        if physio.dim() != 2:
+            return physio
+        if physio.size(0) == self.window_samples:
+            return physio
 
-        # Temporal span dropout
-        temp_prob = self.config.temporal_mask_prob * self._severity
-        if seq_len > 1 and torch.rand(1, device=seq.device).item() < temp_prob:
-            max_masks = max(1, self.config.max_temporal_masks)
-            n_masks = torch.randint(1, max_masks + 1, (1,), device=seq.device).item()
-            for _ in range(n_masks):
-                span_ratio = torch.empty(1, device=seq.device).uniform_(
-                    self.config.min_temporal_span_ratio,
-                    self.config.max_temporal_span_ratio,
-                ).item()
-                span_len = max(1, int(round(span_ratio * seq_len)))
-                span_len = min(span_len, seq_len)
-                max_start = max(1, seq_len - span_len + 1)
-                start = torch.randint(0, max_start, (1,), device=seq.device).item()
-                end = min(seq_len, start + span_len)
+        if self.downsample_strategy == "polyphase":
+            pooled = self._polyphase_downsample(physio)
+        else:
+            pooled = self._avg_downsample(physio)
 
-                if torch.rand(1, device=seq.device).item() < self.config.temporal_mask_band_prob:
-                    mask[start:end, :] = True
-                else:
-                    subset = max(1, int(round(self._severity * n_channels * 0.5)))
-                    channel_sel = torch.randperm(n_channels, device=seq.device)[:subset]
-                    mask[start:end, channel_sel] = True
+        pooled = self._smooth(pooled)
 
-        # Mild noise on unmasked tokens to encourage denoising
-        if self.config.noise_std > 0:
-            noise = torch.randn_like(result) * (self.config.noise_std * self._severity)
-            result = torch.where(mask, result, result + noise)
+        if pooled.size(0) != self.window_samples:
+            pooled = (
+                F.interpolate(
+                    pooled.transpose(0, 1).unsqueeze(0),
+                    size=self.window_samples,
+                    mode="linear",
+                    align_corners=False,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+            )
+        return pooled
 
-        result = result.masked_fill(mask, 0.0)
-        return result, int(mask.sum().item())
+    def __getitem__(self, idx: int):
+        sample = super().__getitem__(idx)
+        if bool(sample["modality_mask"][1].item()):
+            sample["physio"] = self._pool_physio(sample["physio"])
+        return sample
 
 
 # =============================================================================
@@ -156,25 +148,30 @@ class PhysioMasker:
 # =============================================================================
 
 
-def train_epoch_masked(
-    model: PhysioPooledEATMINTPerceiver,
+def train_epoch(
+    model: EATMINTPerceiver,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
     *,
     physio_masker: Optional[PhysioMasker] = None,
     epoch_progress: float = 1.0,
+    loss_weight_schedule: Optional[Callable[[float], Dict[str, float]]] = None,
 ) -> Dict[str, float]:
     model.train()
     if physio_masker is not None:
         physio_masker.update_progress(epoch_progress)
+
+    epoch_weights = None
+    if loss_weight_schedule is not None:
+        epoch_weights = loss_weight_schedule(epoch_progress)
 
     total_loss = 0.0
     modality_losses = {"audio": 0.0, "physio": 0.0, "openface": 0.0, "eyetracker": 0.0}
     mask_ratios: List[float] = []
     n_batches = 0
 
-    pbar = tqdm(dataloader, desc="Training (physio masked)")
+    pbar = tqdm(dataloader, desc="Training (physio 50Hz)")
     for batch in pbar:
         batch = {k: v.to(device) for k, v in batch.items()}
         optimizer.zero_grad()
@@ -198,6 +195,7 @@ def train_epoch_masked(
             outputs,
             {k: batch[k] for k in ["audio", "physio", "openface", "eyetracker"]},
             batch["modality_mask"],
+            modality_weights=epoch_weights,
         )
 
         loss.backward()
@@ -215,14 +213,18 @@ def train_epoch_masked(
         metrics[f"{mod_name}_loss"] = modality_losses[mod_name] / max(1, n_batches)
     if mask_ratios:
         metrics["physio_mask_ratio"] = float(sum(mask_ratios) / len(mask_ratios))
+    if epoch_weights:
+        for mod_name, weight in epoch_weights.items():
+            metrics[f"weight_{mod_name}"] = float(weight)
     return metrics
 
 
-def train_masked(
-    model: PhysioPooledEATMINTPerceiver,
-    dataset: PhysioPooledEATMINTDataset,
+def train(
+    model: EATMINTPerceiver,
+    dataset: Physio50HzDataset,
     *,
     physio_masker: Optional[PhysioMasker] = None,
+    loss_weight_schedule: Optional[Callable[[float], Dict[str, float]]] = None,
     n_epochs: int = 2,
     batch_size: int = 8,
     lr: float = 1e-4,
@@ -244,13 +246,14 @@ def train_masked(
     for epoch in range(n_epochs):
         progress = epoch / max(1, n_epochs - 1)
         print(f"\nEpoch {epoch + 1}/{n_epochs}")
-        metrics = train_epoch_masked(
+        metrics = train_epoch(
             model,
             dataloader,
             optimizer,
             device,
             physio_masker=physio_masker,
             epoch_progress=progress,
+            loss_weight_schedule=loss_weight_schedule,
         )
         scheduler.step()
         history.append(metrics)
@@ -297,7 +300,7 @@ def main() -> None:
     )
 
     print("=" * 60)
-    print("Physio-Pooled Perceiver with Physio Masking")
+    print("Physio-Pooled Perceiver (50 Hz physio)")
     print("=" * 60)
     print(f"\nData root: {config.data_root}")
 
@@ -321,17 +324,18 @@ def main() -> None:
         print("\nLoading Wav2Vec2 audio encoder (on-the-fly extraction)...")
         audio_extractor = AudioFeatureExtractor(device=device)
 
-    dataset = PhysioPooledEATMINTDataset(
+    dataset = Physio50HzDataset(
         config=config,
         availability_df=usable_df,
         audio_extractor=audio_extractor,
         window_size_sec=config.window_size_sec,
         hop_size_sec=config.hop_size_sec,
         target_fs=50.0,
-        physio_target_fs=500.0,
+        physio_target_fs=512.0,
         min_modalities=2,
         use_precomputed_audio=use_precomputed,
         preload=True,
+        smoothing_kernel=0,
     )
     print(f"Dataset windows: {len(dataset)}")
 
@@ -341,7 +345,7 @@ def main() -> None:
         if isinstance(value, torch.Tensor):
             print(f"  {key}: {tuple(value.shape)}")
 
-    model = PhysioPooledEATMINTPerceiver(
+    model = EATMINTPerceiver(
         hidden_dim=256,
         latent_dim=256,
         num_latents=256,
@@ -349,10 +353,7 @@ def main() -> None:
         num_cross_attention_layers=1,
         num_heads=8,
         audio_dim=768,
-        physio_input_dim=len(EATMINTDataset.PHYSIO_SIGNALS),
-        physio_conv_dim=16,
-        physio_seq_len=dataset.physio_window_samples,
-        physio_downsample_factor=dataset.physio_downsample_factor,
+        physio_dim=len(EATMINTDataset.PHYSIO_SIGNALS),
         openface_dim=len(EATMINTDataset.OPENFACE_COLS),
         eyetracker_dim=len(EATMINTDataset.EYETRACKER_COLS),
         seq_len=dataset.window_samples,
@@ -362,25 +363,27 @@ def main() -> None:
 
     mask_config = PhysioMaskingConfig()
     physio_masker = PhysioMasker(mask_config)
+    loss_weight_scheduler = PhysioLossWeightScheduler(PhysioLossWeightConfig())
 
-    history = train_masked(
+    history = train(
         model=model,
         dataset=dataset,
         physio_masker=physio_masker,
+        loss_weight_schedule=loss_weight_scheduler,
         n_epochs=10,
         batch_size=4,
         lr=1e-4,
         device=device,
-        save_path="checkpoints/withMasking_lat256_physiopooled_masked_physio_checkpoint.pt",
+        save_path="checkpoints/physio_50hz_masked_checkpoint.pt",
     )
 
-    plot_training_history(history, save_path="checkpoints/withMasking_lat256_physiopooled_masked_history.png")
+    plot_training_history(history, save_path="checkpoints/physio_50hz_masked_history.png")
     visualize_reconstruction(
         model,
         dataset,
         sample_idx=0,
         device=device,
-        save_path="checkpoints/withMasking_lat256_physiopooled_masked_reconstruction.png",
+        save_path="checkpoints/physio_50hz_masked_reconstruction.png",
     )
 
     print("\nDone!")

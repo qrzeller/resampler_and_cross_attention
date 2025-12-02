@@ -1132,6 +1132,7 @@ def compute_masked_loss(
     outputs: Dict[str, torch.Tensor],
     targets: Dict[str, torch.Tensor],
     modality_mask: torch.Tensor,
+    modality_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute reconstruction loss only on available modalities.
@@ -1149,6 +1150,8 @@ def compute_masked_loss(
     losses = {}
     total_loss = torch.tensor(0.0, device=modality_mask.device)
     n_active = 0
+    weight_sum = 0.0
+    modality_weights = modality_weights or {}
     
     for i, mod_name in enumerate(modality_names):
         mask = modality_mask[:, i]  # (batch,)
@@ -1161,11 +1164,15 @@ def compute_masked_loss(
             # MSE loss
             mod_loss = F.mse_loss(pred, target)
             losses[mod_name] = mod_loss.item()
-            total_loss = total_loss + mod_loss
+            weight = float(modality_weights.get(mod_name, 1.0))
+            total_loss = total_loss + (mod_loss * weight)
             n_active += 1
+            weight_sum += weight
     
-    if n_active > 0:
-        total_loss = total_loss / n_active  # Average across active modalities
+    if weight_sum > 0:
+        total_loss = total_loss / weight_sum
+    elif n_active > 0:
+        total_loss = total_loss / n_active  # Fallback to uniform average
     
     return total_loss, losses
 

@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=str(REPO_ROOT / "checkpoints" / "2physiopooled_masked_physio_checkpoint.pt"),
+        default=str(REPO_ROOT / "checkpoints" / "physio_50hz_noaudio_checkpoint.pt"),
         help="Path to the trained checkpoint to load.",
     )
     parser.add_argument(
@@ -149,7 +149,7 @@ def build_model(bundle: DatasetBundle, device: str, checkpoint_path: str) -> Phy
     model = PhysioPooledEATMINTPerceiver(
         hidden_dim=256,
         latent_dim=256,
-        num_latents=64,
+        num_latents=256,
         num_self_attention_layers=6,
         num_cross_attention_layers=1,
         num_heads=8,
@@ -237,7 +237,7 @@ def reconstruct_and_plot(
     fig.tight_layout(rect=(0, 0.03, 1, 0.97))
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"with_maskingsample_{sample_idx:05d}_physio_recon.png"
+    output_path = output_dir / f"50hz_{sample_idx:05d}_physio_recon.png"
     fig.savefig(output_path, dpi=200)
     print(f"Saved plot to {output_path}")
 

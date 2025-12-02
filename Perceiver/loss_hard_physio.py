@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch.optim import AdamW
@@ -152,6 +152,73 @@ class PhysioMasker:
 
 
 # =============================================================================
+# Loss weighting policy
+# =============================================================================
+
+
+@dataclass
+class PhysioLossWeightConfig:
+    """Configuration for prioritizing physio reconstruction losses."""
+
+    focus_fraction: float = 0.65  # Portion of training dedicated to physio-first
+    max_physio_weight: float = 4.0
+    min_other_weight: float = 0.25
+    mid_physio_weight: float = 1.25
+    mid_other_weight: float = 0.9
+
+
+class PhysioLossWeightScheduler:
+    """Smoothly anneals modality weights to focus on physio early in training."""
+
+    def __init__(self, config: PhysioLossWeightConfig) -> None:
+        self.config = config
+        self._modality_names = ["audio", "physio", "openface", "eyetracker"]
+
+    def __call__(self, progress: float) -> Dict[str, float]:
+        progress = float(min(max(progress, 0.0), 1.0))
+        focus = float(min(max(self.config.focus_fraction, 1e-3), 0.99))
+
+        if progress < focus:
+            phase = progress / focus
+            physio_weight = self._cosine_blend(
+                self.config.max_physio_weight,
+                self.config.mid_physio_weight,
+                phase,
+            )
+            other_weight = self._cosine_blend(
+                self.config.min_other_weight,
+                self.config.mid_other_weight,
+                phase,
+            )
+        else:
+            tail = (progress - focus) / max(1.0 - focus, 1e-3)
+            physio_weight = self._cosine_blend(
+                self.config.mid_physio_weight,
+                1.0,
+                tail,
+            )
+            other_weight = self._cosine_blend(
+                self.config.mid_other_weight,
+                1.0,
+                tail,
+            )
+
+        physio_weight = max(1e-3, physio_weight)
+        other_weight = max(1e-3, other_weight)
+
+        weights = {mod: other_weight for mod in self._modality_names}
+        weights["physio"] = physio_weight
+        return weights
+
+    @staticmethod
+    def _cosine_blend(start: float, end: float, t: float) -> float:
+        t = float(min(max(t, 0.0), 1.0))
+        # Cosine easing keeps the schedule smooth and monotonic.
+        blend = 0.5 - 0.5 * math.cos(math.pi * t)
+        return start + (end - start) * blend
+
+
+# =============================================================================
 # Training helpers
 # =============================================================================
 
@@ -164,10 +231,15 @@ def train_epoch_masked(
     *,
     physio_masker: Optional[PhysioMasker] = None,
     epoch_progress: float = 1.0,
+    loss_weight_schedule: Optional[Callable[[float], Dict[str, float]]] = None,
 ) -> Dict[str, float]:
     model.train()
     if physio_masker is not None:
         physio_masker.update_progress(epoch_progress)
+
+    epoch_weights = None
+    if loss_weight_schedule is not None:
+        epoch_weights = loss_weight_schedule(epoch_progress)
 
     total_loss = 0.0
     modality_losses = {"audio": 0.0, "physio": 0.0, "openface": 0.0, "eyetracker": 0.0}
@@ -198,6 +270,7 @@ def train_epoch_masked(
             outputs,
             {k: batch[k] for k in ["audio", "physio", "openface", "eyetracker"]},
             batch["modality_mask"],
+            modality_weights=epoch_weights,
         )
 
         loss.backward()
@@ -215,6 +288,9 @@ def train_epoch_masked(
         metrics[f"{mod_name}_loss"] = modality_losses[mod_name] / max(1, n_batches)
     if mask_ratios:
         metrics["physio_mask_ratio"] = float(sum(mask_ratios) / len(mask_ratios))
+    if epoch_weights:
+        for mod_name, weight in epoch_weights.items():
+            metrics[f"weight_{mod_name}"] = float(weight)
     return metrics
 
 
@@ -223,6 +299,7 @@ def train_masked(
     dataset: PhysioPooledEATMINTDataset,
     *,
     physio_masker: Optional[PhysioMasker] = None,
+    loss_weight_schedule: Optional[Callable[[float], Dict[str, float]]] = None,
     n_epochs: int = 2,
     batch_size: int = 8,
     lr: float = 1e-4,
@@ -251,6 +328,7 @@ def train_masked(
             device,
             physio_masker=physio_masker,
             epoch_progress=progress,
+            loss_weight_schedule=loss_weight_schedule,
         )
         scheduler.step()
         history.append(metrics)
@@ -362,25 +440,27 @@ def main() -> None:
 
     mask_config = PhysioMaskingConfig()
     physio_masker = PhysioMasker(mask_config)
+    loss_weight_scheduler = PhysioLossWeightScheduler(PhysioLossWeightConfig())
 
     history = train_masked(
         model=model,
         dataset=dataset,
         physio_masker=physio_masker,
+        loss_weight_schedule=loss_weight_scheduler,
         n_epochs=10,
         batch_size=4,
         lr=1e-4,
         device=device,
-        save_path="checkpoints/withMasking_lat256_physiopooled_masked_physio_checkpoint.pt",
+        save_path="checkpoints/physio_first_physiopooled_masked_physio_checkpoint.pt",
     )
 
-    plot_training_history(history, save_path="checkpoints/withMasking_lat256_physiopooled_masked_history.png")
+    plot_training_history(history, save_path="checkpoints/physio_first_physiopooled_masked_history.png")
     visualize_reconstruction(
         model,
         dataset,
         sample_idx=0,
         device=device,
-        save_path="checkpoints/withMasking_lat256_physiopooled_masked_reconstruction.png",
+        save_path="checkpoints/physio_first_physiopooled_masked_reconstruction.png",
     )
 
     print("\nDone!")
