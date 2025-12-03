@@ -111,3 +111,110 @@ But big picture: your main problem was 100% the Fourier feature scaling. You fix
 ____
 
 Patching + else STfft
+
+The "smoothing" you are seeing is the **expected behavior** of an Autoencoder trained with **MSE Loss** (Mean Squared Error) when the "Identity Cheat" (residual) is removed.
+
+____
+
+### 2\. Increase Fourier Resolution (The "Clock" Precision)
+
+Your input sequence is 6144 steps long (12s @ 512Hz).
+Your default `--fourier-bands` is 32.
+
+While 32 bands cover the frequency range, the **Cross-Attention mechanism** uses these bands as "Keys" to locate data. With 6000 steps, "soft" collisions happen in the positional encoding space, causing the attention mechanism to "smear" its focus over neighboring time steps.
+
+**Action:** Increase `--fourier-bands` to **64** or **96**.
+
+  * This creates a higher-dimensional "barcode" for every time step, making $t$ look mathematically very different from $t+1$. This helps the attention head snap to the exact millisecond rather than a localized blur.
+
+### 3\. The "Patching" Code Modification (The Real Fix)
+
+This is the most technical and effective fix.
+Currently, your Perceiver has to attend to **6144 individual time steps**.
+$$\text{Attention}(Q, K) = \text{Softmax}\left(\frac{QK^T}{\sqrt{d}}\right)$$
+When the sequence length ($N$) is 6144, the Softmax distribution has high entropy. The "probability mass" gets spread out.
+
+**Patching** groups time steps together *before* the transformer sees them.
+
+  * **Strategy:** Group every 8 time steps into 1 "Patch".
+  * **New Sequence Length:** $6144 / 8 = \mathbf{768}$.
+  * **New Input Dim:** $5 \text{ leads} \times 8 = \mathbf{40}$.
+
+**Why this fixes smoothing:**
+The attention mechanism now only has to choose 1 out of 768 locations. It is mathematically much easier for the Softmax to be "sharp" (close to a one-hot vector) on a shorter sequence.
+
+Here is the code modification for your `PerceiverResampler` class. Replace your `__init__` and `forward` with this patched version:
+
+```python
+class PerceiverResampler(nn.Module):
+    def __init__(
+        self,
+        signal_dim: int,
+        seq_len: int,
+        sample_rate_hz: float,
+        patch_size: int = 8,  # <--- NEW PARAMETER
+        latent_dim: int = 256,
+        num_latents: int = 256,
+        # ... keep other args same ...
+        **kwargs
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.seq_len = int(seq_len)
+        
+        # Ensure sequence is divisible by patch size
+        if self.seq_len % self.patch_size != 0:
+            raise ValueError(f"seq_len {seq_len} not divisible by patch_size {patch_size}")
+            
+        self.patched_seq_len = self.seq_len // self.patch_size
+        
+        # ... (keep sample rate and window duration logic) ...
+
+        # Update Fourier Features to match the PATCHED length, not full length
+        # We use the time of the *first* sample in the patch as the anchor
+        t_enc = (torch.arange(self.patched_seq_len, dtype=torch.float32) * self.patch_size / max(self.sample_rate_hz, 1e-6)).view(1, self.patched_seq_len, 1)
+        
+        # ... (register buffers as before) ...
+
+        # INPUT DIM CALCULATION CHANGE
+        # The input to the linear layer is now: (signal_dim * patch_size) + fourier_dim
+        token_dim = (signal_dim * self.patch_size) + self.encoder_pos.output_dim
+        
+        self.input_proj = nn.Linear(token_dim, latent_dim)
+        
+        # ... (rest of init is identical) ...
+
+    def forward(self, series: torch.Tensor, return_latents: bool = False):
+        # series shape: [Batch, 6144, 5]
+        batch, seq_len, channels = series.shape
+        
+        # 1. PATCHING OPERATION
+        # Reshape: [B, 768, 8, 5] -> Flatten last two: [B, 768, 40]
+        series_patched = series.view(batch, seq_len // self.patch_size, self.patch_size, channels)
+        series_flat = series_patched.reshape(batch, seq_len // self.patch_size, channels * self.patch_size)
+        
+        # 2. Add Fourier Features (aligned to patched grid)
+        enc_pos = self.encoder_positions.to(series.device, dtype=series.dtype).expand(batch, -1, -1)
+        enc_features = self.encoder_pos(enc_pos)
+        
+        # 3. Concatenate
+        tokens = torch.cat([series_flat, enc_features], dim=-1)
+        tokens = self.input_proj(tokens) # Projects 40+Fourier -> latent_dim
+
+        # ... (Cross Attention and Self Attention logic is identical) ...
+        
+        # ... (Decoder Logic) ...
+        # The decoder queries usually query for the FULL resolution (6144)
+        # So we don't patch the decoder part, we let the CrossAttention expand it back
+        
+        dec_pos = self.decoder_positions.to(series.device, dtype=series.dtype).expand(batch, -1, -1)
+        dec_features = self.decoder_pos(dec_pos)
+        queries = self.query_proj(dec_features)
+        decoded = self.decoder_cross(queries, latents)
+        
+        delta = self.output_proj(decoded)
+        
+        # No residual needed for autoencoding task now
+        return delta
+```
+
