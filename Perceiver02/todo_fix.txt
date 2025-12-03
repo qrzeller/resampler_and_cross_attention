@@ -1,0 +1,113 @@
+Two small tweaks I’d actually make in your current code
+1) Use the true window duration for min_freq_hz
+
+Right now you compute:
+
+self.window_duration_sec = (self.seq_len - 1) / sample_rate_hz
+
+
+That’s “time between first and last sample”, which is almost the window size, but slightly smaller. This is minor, but if you want min_freq_hz ≈ 1/window_size, use the real window size directly.
+
+Simplest change: pass window_size_sec into the model and do:
+
+self.window_duration_sec = window_size_sec
+min_freq_hz = 1.0 / window_size_sec
+
+
+As-is, you’re off by ~1/FS (e.g. 0.02s at 50 Hz). Not catastrophic—just cleaner.
+
+2) Keep Fourier positions in float32 even if you use mixed precision
+
+You do:
+
+enc_pos = self.encoder_positions.to(series.device, dtype=series.dtype)
+
+
+If you ever run fp16/bf16, trig at low precision can get a bit crunchy. A safe pattern is:
+
+keep positions in fp32 for sin/cos
+
+then cast the resulting embedding to series.dtype if you want
+
+Again: optional, but it prevents weird “precision ghosts” later.
+
+“It compresses well” — sanity check
+
+Compression here is basically:
+
+input size per window: seq_len * signal_dim
+
+latent size: num_latents * latent_dim
+
+So it’s only true compression if:
+
+𝑛
+𝑢
+𝑚
+_
+𝑙
+𝑎
+𝑡
+𝑒
+𝑛
+𝑡
+𝑠
+⋅
+𝑙
+𝑎
+𝑡
+𝑒
+𝑛
+𝑡
+_
+𝑑
+𝑖
+𝑚
+  
+<
+  
+𝑠
+𝑒
+𝑞
+_
+𝑙
+𝑒
+𝑛
+⋅
+𝑠
+𝑖
+𝑔
+𝑛
+𝑎
+𝑙
+_
+𝑑
+𝑖
+𝑚
+num_latents⋅latent_dim<seq_len⋅signal_dim
+
+(Unless you’re also quantizing / entropy coding latents later.)
+
+If you want, add a one-line print after dataset init:
+
+print("compression ratio:",
+      (seq_len * len(EATMINTDataset.PHYSIO_SIGNALS)) / (args.num_latents * args.latent_dim))
+
+Bonus: if you want “compression outputs” explicitly
+
+You already support return_latents=True in forward. The next practical step is adding:
+
+encode(series) -> latents
+
+decode(latents) -> recon
+
+so you can store latents without running decode every time.
+
+But big picture: your main problem was 100% the Fourier feature scaling. You fixed the coordinate system, and the model stopped being forced into “smooth trend mode.”
+
+
+
+
+____
+
+Patching + else STfft

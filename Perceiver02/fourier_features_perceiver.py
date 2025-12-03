@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 """
-Perceiver IO-style physio autoencoder (physio-only) — with *proper* Fourier features.
+Perceiver IO-style physio autoencoder (physio-only) - with *proper* Fourier features.
 
 Fixes included:
 - Uses time positions in **seconds** (not [-1, 1]) and Fourier features as:
@@ -486,7 +487,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downsample-strategy", choices=["polyphase", "avg"], default="polyphase")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--latent-dim", type=int, default=256)
     parser.add_argument("--num-latents", type=int, default=128)
     parser.add_argument("--self-layers", type=int, default=4)
