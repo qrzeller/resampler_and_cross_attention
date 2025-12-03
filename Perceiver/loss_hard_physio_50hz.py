@@ -371,7 +371,7 @@ def main() -> None:
         physio_masker=physio_masker,
         loss_weight_schedule=loss_weight_scheduler,
         n_epochs=10,
-        batch_size=4,
+        batch_size=1,
         lr=1e-5,
         device=device,
         save_path="checkpoints/physio_50hz_masked_checkpoint.pt",
