@@ -295,7 +295,7 @@ def main() -> None:
 
     config = EATMINTConfig(
         data_root=str(data_root),
-        window_size_sec=8.0,
+        window_size_sec=12.0,
         hop_size_sec=4.0,
     )
 
@@ -349,8 +349,8 @@ def main() -> None:
         hidden_dim=256,
         latent_dim=256,
         num_latents=256,
-        num_self_attention_layers=6,
-        num_cross_attention_layers=1,
+        num_self_attention_layers=12,
+        num_cross_attention_layers=2,
         num_heads=8,
         audio_dim=768,
         physio_dim=len(EATMINTDataset.PHYSIO_SIGNALS),
@@ -372,7 +372,7 @@ def main() -> None:
         loss_weight_schedule=loss_weight_scheduler,
         n_epochs=10,
         batch_size=4,
-        lr=1e-4,
+        lr=1e-5,
         device=device,
         save_path="checkpoints/physio_50hz_masked_checkpoint.pt",
     )
