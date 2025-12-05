@@ -204,6 +204,8 @@ class EATMINTPhysioDataset(Dataset):
         physio_fs: float = 512.0,
         smoothing_kernel: int = 0,
         downsample_strategy: str = "polyphase",
+        ecg_band: Optional[tuple[float, float]] = (0.5, 40.0),
+        detrend_non_ecg: bool = True,
         preload: bool = False,
     ):
         super().__init__()
@@ -214,6 +216,8 @@ class EATMINTPhysioDataset(Dataset):
         self.physio_fs = float(physio_fs)
         self.smoothing_kernel = max(0, int(smoothing_kernel))
         self.downsample_strategy = downsample_strategy
+        self.ecg_band = ecg_band
+        self.detrend_non_ecg = bool(detrend_non_ecg)
 
         # Calculate window samples at target rate
         self.window_samples = int(round(self.window_size_sec * self.target_fs))
@@ -316,7 +320,28 @@ class EATMINTPhysioDataset(Dataset):
 
         physio_data = np.stack(physio_signals, axis=1).astype(np.float32)
 
-        # Z-score normalize each channel
+        # Optional preprocessing: ECG band-pass + detrend other channels
+        fs = float(physio["fs"])
+        # ECG is channel index 1 in PHYSIO_SIGNALS
+        ecg_idx = self.PHYSIO_SIGNALS.index("ECG") if "ECG" in self.PHYSIO_SIGNALS else None
+
+        if ecg_idx is not None and self.ecg_band is not None:
+            low, high = self.ecg_band
+            # Clamp to valid range and design a Butterworth band-pass
+            nyq = 0.5 * fs
+            low = max(0.001, float(low) / nyq)
+            high = min(0.999, float(high) / nyq)
+            if low < high:
+                b, a = signal.butter(4, [low, high], btype="bandpass")
+                physio_data[:, ecg_idx] = signal.filtfilt(b, a, physio_data[:, ecg_idx])
+
+        if self.detrend_non_ecg:
+            for ch_idx, sig_name in enumerate(self.PHYSIO_SIGNALS):
+                if sig_name == "ECG":
+                    continue
+                physio_data[:, ch_idx] = signal.detrend(physio_data[:, ch_idx], type="constant")
+
+        # Z-score normalize each channel (after filtering/detrend)
         physio_mean = np.mean(physio_data, axis=0, keepdims=True)
         physio_std = np.std(physio_data, axis=0, keepdims=True)
         physio_std = np.where(physio_std < 1e-8, 1.0, physio_std)
@@ -462,6 +487,8 @@ def create_eatmint_dataset(
     physio_fs: float = 512.0,
     smoothing_kernel: int = 0,
     downsample_strategy: str = "polyphase",
+    ecg_band: Optional[tuple[float, float]] = (0.5, 40.0),
+    detrend_non_ecg: bool = True,
     preload: bool = False,
 ) -> EATMINTPhysioDataset:
     """
@@ -475,6 +502,8 @@ def create_eatmint_dataset(
         physio_fs: Native physio sampling rate (Hz)
         smoothing_kernel: Kernel size for smoothing (0=disabled)
         downsample_strategy: "polyphase" or "avg"
+        ecg_band: Optional (low, high) band-pass for ECG in Hz; set to None to disable
+        detrend_non_ecg: If True, remove DC from non-ECG channels
         preload: Whether to preload all data
 
     Returns:
@@ -501,5 +530,7 @@ def create_eatmint_dataset(
         physio_fs=physio_fs,
         smoothing_kernel=smoothing_kernel,
         downsample_strategy=downsample_strategy,
+        ecg_band=ecg_band,
+        detrend_non_ecg=detrend_non_ecg,
         preload=preload,
     )
