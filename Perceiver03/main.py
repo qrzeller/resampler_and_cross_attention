@@ -10,10 +10,15 @@ Features:
 - Residual decoding to fight over-smoothing
 - Optional first-difference loss term
 - Modular design: perceiver_model, dataset, training, visualization
+- Supports both synthetic data and real EATMINT physio data
 
 Usage:
+    # Synthetic data (for testing)
     python main.py --epochs 10 --batch-size 8
-    python main.py --epochs 5 --num-windows 50 --target-fs 50 --physio-fs 512
+
+    # Real EATMINT data
+    python main.py --use-eatmint --data-root ../data/researchdata --epochs 20
+
     python main.py --help
 """
 
@@ -41,12 +46,31 @@ def parse_args() -> argparse.Namespace:
         description="Perceiver IO autoencoder for physio time-series with proper Fourier features"
     )
 
+    # Data source selection
+    parser.add_argument(
+        "--use-eatmint",
+        action="store_true",
+        help="Use real EATMINT physio data instead of synthetic data",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default="../data/EATMINT/researchdata",
+        help="Path to EATMINT data root (default: ../data/EATMINT/researchdata)",
+    )
+
     # Dataset parameters
     parser.add_argument(
         "--window-size",
         type=float,
         default=12.0,
         help="Window size in seconds (default: 12.0)",
+    )
+    parser.add_argument(
+        "--hop-size",
+        type=float,
+        default=6.0,
+        help="Hop size in seconds for EATMINT data (default: 6.0)",
     )
     parser.add_argument(
         "--target-fs",
@@ -76,13 +100,18 @@ def parse_args() -> argparse.Namespace:
         "--num-windows",
         type=int,
         default=200,
-        help="Number of synthetic windows to generate (default: 200)",
+        help="Number of synthetic windows to generate (default: 200, ignored with --use-eatmint)",
     )
     parser.add_argument(
         "--num-signals",
         type=int,
         default=5,
         help="Number of signal channels (default: 5)",
+    )
+    parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Preload all data into memory (recommended for EATMINT)",
     )
 
     # Model parameters
@@ -243,24 +272,47 @@ def main() -> None:
     # =========================================================================
     # Dataset setup
     # =========================================================================
-    print("Creating dataset...")
-    dataset = PhysioResampledDataset(
-        window_size_sec=args.window_size,
-        hop_size_sec=args.window_size,  # No overlap for synthetic
-        target_fs=args.target_fs,
-        physio_fs=args.physio_fs,
-        num_signals=args.num_signals,
-        num_windows=args.num_windows,
-        smoothing_kernel=args.smoothing_kernel,
-        downsample_strategy=args.downsample_strategy,
-        seed=args.seed,
-        use_dummy_data=True,
-    )
+    if args.use_eatmint:
+        # Use real EATMINT physio data
+        print("Loading EATMINT physio dataset...")
+        print(f"  Data root: {args.data_root}")
+        from eatmint_dataset import create_eatmint_dataset
+
+        dataset = create_eatmint_dataset(
+            data_root=args.data_root,
+            window_size_sec=args.window_size,
+            hop_size_sec=args.hop_size,
+            target_fs=args.target_fs,
+            physio_fs=args.physio_fs,
+            smoothing_kernel=args.smoothing_kernel,
+            downsample_strategy=args.downsample_strategy,
+            preload=args.preload,
+        )
+        feature_names = dataset.get_signal_names()
+        num_signals = len(feature_names)
+        print(f"  Signals: {feature_names}")
+    else:
+        # Use synthetic data
+        print("Creating synthetic dataset...")
+        dataset = PhysioResampledDataset(
+            window_size_sec=args.window_size,
+            hop_size_sec=args.window_size,  # No overlap for synthetic
+            target_fs=args.target_fs,
+            physio_fs=args.physio_fs,
+            num_signals=args.num_signals,
+            num_windows=args.num_windows,
+            smoothing_kernel=args.smoothing_kernel,
+            downsample_strategy=args.downsample_strategy,
+            seed=args.seed,
+            use_dummy_data=True,
+        )
+        feature_names = [f"Signal_{i}" for i in range(args.num_signals)]
+        num_signals = args.num_signals
 
     seq_len = dataset.window_samples
     print(f"  Total windows: {len(dataset)}")
     print(f"  Window size: {seq_len} samples @ {args.target_fs} Hz")
-    print(f"  Signal channels: {args.num_signals}")
+    print(f"  Signal channels: {num_signals}")
     print()
 
     # Calculate effective Fourier parameters
@@ -315,7 +367,7 @@ def main() -> None:
     # =========================================================================
     print("Creating model...")
     model = PerceiverResampler(
-        signal_dim=args.num_signals,
+        signal_dim=num_signals,
         seq_len=seq_len,
         sample_rate_hz=args.target_fs,
         latent_dim=args.latent_dim,
@@ -384,6 +436,7 @@ def main() -> None:
                 device,
                 max_samples=4,
                 save_path=args.recon_fig,
+                feature_names=feature_names,
             )
         except Exception as exc:
             print(f"Warning: failed to plot reconstructions ({exc})")
@@ -401,6 +454,7 @@ def main() -> None:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "history": history,
                 "config": vars(args),
+                "feature_names": feature_names,
             },
             ckpt_path,
         )

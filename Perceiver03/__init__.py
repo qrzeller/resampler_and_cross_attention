@@ -7,6 +7,18 @@ from dataset import PhysioTimeSeriesDataset, PhysioResampledDataset, SyntheticPh
 from training import train_epoch, evaluate, train_model, masked_reconstruction_loss
 from visualization import plot_physio_reconstructions, plot_training_history
 
+# EATMINT real data loading (optional import)
+try:
+    from eatmint_dataset import (
+        EATMINTConfig,
+        EATMINTPhysioDataset,
+        create_eatmint_dataset,
+        check_physio_availability,
+    )
+    _EATMINT_AVAILABLE = True
+except ImportError:
+    _EATMINT_AVAILABLE = False
+
 __all__ = [
     "FourierFeatures",
     "PerceiverResampler",
@@ -22,6 +34,11 @@ __all__ = [
     "masked_reconstruction_loss",
     "plot_physio_reconstructions",
     "plot_training_history",
+    # EATMINT
+    "EATMINTConfig",
+    "EATMINTPhysioDataset",
+    "create_eatmint_dataset",
+    "check_physio_availability",
 ]
 
 __version__ = "1.0.0"
