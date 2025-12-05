@@ -38,6 +38,7 @@ from dataset import PhysioResampledDataset, SyntheticPhysioDataset
 from perceiver_model import PerceiverResampler
 from training import train_model
 from visualization import plot_physio_reconstructions, plot_training_history
+from run_logger import create_run_logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,22 +210,40 @@ def parse_args() -> argparse.Namespace:
 
     # I/O parameters
     parser.add_argument(
+        "--run-output",
+        type=str,
+        default="runs",
+        help="Base directory for run outputs (default: runs)",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional name for this run (appended to timestamp)",
+    )
+    parser.add_argument(
+        "--comment",
+        type=str,
+        default=None,
+        help="Comment or goal description for this run (saved in report)",
+    )
+    parser.add_argument(
         "--save-checkpoint",
         type=str,
         default=None,
-        help="Save checkpoint to this path (optional)",
+        help="Save checkpoint to this path (optional, or use --run-output)",
     )
     parser.add_argument(
         "--recon-fig",
         type=str,
-        default="Perceiver03/physio_recon.png",
-        help="Save reconstruction figure to this path",
+        default=None,
+        help="Save reconstruction figure to this path (default: auto in run folder)",
     )
     parser.add_argument(
         "--history-fig",
         type=str,
-        default="Perceiver03/training_history.png",
-        help="Save training history figure to this path",
+        default=None,
+        help="Save training history figure to this path (default: auto in run folder)",
     )
 
     # Other
@@ -254,6 +273,19 @@ def main() -> None:
     """Main training loop."""
     args = parse_args()
 
+    # Setup run logger for automatic documentation
+    run_logger = create_run_logger(
+        output_base=args.run_output,
+        run_name=args.run_name,
+        comment=args.comment,
+    )
+    paths = run_logger.get_paths()
+    
+    # Use run logger paths unless explicitly overridden
+    recon_fig_path = args.recon_fig if args.recon_fig else paths["recon_fig"]
+    history_fig_path = args.history_fig if args.history_fig else paths["history_fig"]
+    checkpoint_path = args.save_checkpoint if args.save_checkpoint else paths["checkpoint"]
+
     # Setup device and seeds
     torch.manual_seed(args.seed)
     device = (
@@ -265,8 +297,11 @@ def main() -> None:
     print("=" * 78)
     print("Perceiver IO Physio Autoencoder (Standalone, Modular)")
     print("=" * 78)
+    print(f"Run output: {paths['run_dir']}")
     print(f"Device: {device}")
     print(f"Random seed: {args.seed}")
+    if args.comment:
+        print(f"Comment: {args.comment}")
     print()
 
     # =========================================================================
@@ -413,6 +448,11 @@ def main() -> None:
         diff_weight=args.diff_loss_weight,
     )
 
+    # Store config and history in run logger
+    run_logger.set_config(vars(args))
+    run_logger.set_history(history)
+    run_logger.add_metric("total_parameters", num_params)
+
     # =========================================================================
     # Post-training visualization
     # =========================================================================
@@ -422,45 +462,52 @@ def main() -> None:
 
     # Plot training history
     if history:
-        print(f"\nSaving training history plot to {args.history_fig}...")
-        plot_training_history(history, save_path=args.history_fig)
+        print(f"\nSaving training history plot to {history_fig_path}...")
+        plot_training_history(history, save_path=history_fig_path)
 
     # Plot reconstructions
     plot_dataset = val_ds if val_ds is not None else train_ds
     if plot_dataset is not None and len(plot_dataset) > 0:
         try:
-            print(f"Saving reconstruction plot to {args.recon_fig}...")
+            print(f"Saving reconstruction plot to {recon_fig_path}...")
             plot_physio_reconstructions(
                 model,
                 plot_dataset,
                 device,
                 max_samples=4,
-                save_path=args.recon_fig,
+                save_path=recon_fig_path,
                 feature_names=feature_names,
             )
         except Exception as exc:
             print(f"Warning: failed to plot reconstructions ({exc})")
 
     # =========================================================================
-    # Checkpoint saving (optional)
+    # Checkpoint saving
     # =========================================================================
-    if args.save_checkpoint:
-        print(f"\nSaving checkpoint to {args.save_checkpoint}...")
-        ckpt_path = Path(args.save_checkpoint)
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "history": history,
-                "config": vars(args),
-                "feature_names": feature_names,
-            },
-            ckpt_path,
-        )
+    print(f"\nSaving checkpoint to {checkpoint_path}...")
+    ckpt_path = Path(checkpoint_path)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
+            "config": vars(args),
+            "feature_names": feature_names,
+        },
+        ckpt_path,
+    )
+
+    # =========================================================================
+    # Generate run report
+    # =========================================================================
+    print(f"\nGenerating run report...")
+    report_path = run_logger.generate_report()
+    print(f"Report saved to: {report_path}")
 
     print("\n" + "=" * 78)
     print("Training complete!")
+    print(f"All outputs saved to: {paths['run_dir']}")
     print("=" * 78)
 
 

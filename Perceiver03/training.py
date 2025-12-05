@@ -23,6 +23,7 @@ def masked_reconstruction_loss(
     """
     Compute masked reconstruction loss with optional first-difference term.
 
+    Uses L1 loss (mean absolute error) instead of MSE for more robust training.
     The first-difference loss helps combat over-smoothing by encouraging
     the model to preserve temporal dynamics.
 
@@ -36,10 +37,10 @@ def masked_reconstruction_loss(
         loss: Scalar loss value
         num_valid: Number of valid samples in batch
     """
-    # Reconstruction loss
-    mse = F.mse_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
+    # Reconstruction loss: L1 (mean absolute error) instead of MSE
+    l1 = F.l1_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
 
-    # First-difference loss (finite differences)
+    # First-difference loss (finite differences) - also L1
     if (
         diff_weight > 0.0
         and predictions.size(1) > 1
@@ -47,10 +48,10 @@ def masked_reconstruction_loss(
     ):
         dp = predictions[:, 1:] - predictions[:, :-1]
         dt = targets[:, 1:] - targets[:, :-1]
-        dmse = F.mse_loss(dp, dt, reduction="none").mean(dim=(1, 2))
-        per_sample = mse + diff_weight * dmse
+        dl1 = F.l1_loss(dp, dt, reduction="none").mean(dim=(1, 2))
+        per_sample = l1 + diff_weight * dl1
     else:
-        per_sample = mse
+        per_sample = l1
 
     # Apply mask if provided
     if mask is not None:
