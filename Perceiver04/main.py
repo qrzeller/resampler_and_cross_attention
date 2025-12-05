@@ -207,6 +207,12 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Weight for first-difference loss (default: 0.2, set to 0 to disable)",
     )
+    parser.add_argument(
+        "--modality-dropout-p",
+        type=float,
+        default=0.2,
+        help="Probability of dropping each modality/channel during training (default: 0.2)",
+    )
 
     # I/O parameters
     parser.add_argument(
@@ -436,6 +442,7 @@ def main() -> None:
     print(f"  Optimizer: AdamW (lr={args.lr}, weight_decay=1e-2)")
     print(f"  Epochs: {args.epochs}")
     print(f"  Diff loss weight: {args.diff_loss_weight}")
+    print(f"  Modality dropout p: {args.modality_dropout_p}")
     print()
 
     history = train_model(
@@ -446,6 +453,7 @@ def main() -> None:
         device,
         num_epochs=args.epochs,
         diff_weight=args.diff_loss_weight,
+        modality_dropout_p=args.modality_dropout_p,
     )
 
     # Store config and history in run logger

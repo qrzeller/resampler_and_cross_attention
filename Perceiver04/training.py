@@ -74,6 +74,7 @@ def train_epoch(
     optimizer: Optimizer,
     device: torch.device,
     diff_weight: float = 0.2,
+    modality_dropout_p: float = 0.2,
 ) -> Dict[str, float]:
     """
     Run one training epoch.
@@ -94,14 +95,22 @@ def train_epoch(
 
     for batch in tqdm(dataloader, desc="Train", leave=False):
         physio = batch["physio"].to(device)
-        mask = batch.get("mask")
-        if mask is not None:
-            mask = mask.to(device)
+
+        # Modality dropout: randomly drop entire channels in the input
+        if modality_dropout_p > 0.0:
+            keep_prob = max(0.0, min(1.0, 1.0 - modality_dropout_p))
+            b, _, c = physio.shape
+            mod_mask = torch.bernoulli(
+                torch.full((b, 1, c), keep_prob, device=physio.device)
+            )
+            physio_in = physio * mod_mask
+        else:
+            physio_in = physio
 
         optimizer.zero_grad(set_to_none=True)
-        recon = model(physio)
+        recon = model(physio_in)
         loss, valid = masked_reconstruction_loss(
-            recon, physio, mask=mask, diff_weight=diff_weight
+            recon, physio, mask=None, diff_weight=diff_weight
         )
 
         if valid == 0:
@@ -122,6 +131,7 @@ def evaluate(
     dataloader: Optional[DataLoader],
     device: torch.device,
     diff_weight: float = 0.2,
+    modality_dropout_p: float = 0.0,
 ) -> Dict[str, float]:
     """
     Evaluate model on a dataset.
@@ -145,13 +155,21 @@ def evaluate(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Val", leave=False):
             physio = batch["physio"].to(device)
-            mask = batch.get("mask")
-            if mask is not None:
-                mask = mask.to(device)
 
-            recon = model(physio)
+            # Optionally apply modality dropout at evaluation (default disabled)
+            if modality_dropout_p > 0.0:
+                keep_prob = max(0.0, min(1.0, 1.0 - modality_dropout_p))
+                b, _, c = physio.shape
+                mod_mask = torch.bernoulli(
+                    torch.full((b, 1, c), keep_prob, device=physio.device)
+                )
+                physio_in = physio * mod_mask
+            else:
+                physio_in = physio
+
+            recon = model(physio_in)
             loss, valid = masked_reconstruction_loss(
-                recon, physio, mask=mask, diff_weight=diff_weight
+                recon, physio, mask=None, diff_weight=diff_weight
             )
 
             if valid == 0:
@@ -171,6 +189,7 @@ def train_model(
     device: torch.device,
     num_epochs: int,
     diff_weight: float = 0.2,
+    modality_dropout_p: float = 0.2,
 ) -> List[Dict[str, float]]:
     """
     Run full training loop.
@@ -194,11 +213,22 @@ def train_model(
 
         # Train
         train_metrics = train_epoch(
-            model, train_loader, optimizer, device, diff_weight=diff_weight
+            model,
+            train_loader,
+            optimizer,
+            device,
+            diff_weight=diff_weight,
+            modality_dropout_p=modality_dropout_p,
         )
 
         # Validate
-        val_metrics = evaluate(model, val_loader, device, diff_weight=diff_weight)
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            diff_weight=diff_weight,
+            modality_dropout_p=0.0,
+        )
 
         # Record
         history.append(
