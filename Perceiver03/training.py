@@ -37,8 +37,10 @@ def masked_reconstruction_loss(
         loss: Scalar loss value
         num_valid: Number of valid samples in batch
     """
-    # Reconstruction loss: L1 (mean absolute error) instead of MSE
-    l1 = F.l1_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
+    # Reconstruction loss: was L1 (mean absolute error)
+    # l1 = F.l1_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
+    # Switched to Huber loss for smoother robustness
+    l1 = F.huber_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
 
     # First-difference loss (finite differences) - also L1
     if (
@@ -48,7 +50,9 @@ def masked_reconstruction_loss(
     ):
         dp = predictions[:, 1:] - predictions[:, :-1]
         dt = targets[:, 1:] - targets[:, :-1]
-        dl1 = F.l1_loss(dp, dt, reduction="none").mean(dim=(1, 2))
+        # First-difference loss: was L1, now Huber for consistency
+        # dl1 = F.l1_loss(dp, dt, reduction="none").mean(dim=(1, 2))
+        dl1 = F.huber_loss(dp, dt, reduction="none").mean(dim=(1, 2))
         per_sample = l1 + diff_weight * dl1
     else:
         per_sample = l1
