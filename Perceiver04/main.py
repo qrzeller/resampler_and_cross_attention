@@ -37,7 +37,11 @@ from torch.utils.data import DataLoader, random_split, Subset
 from dataset import PhysioResampledDataset, SyntheticPhysioDataset
 from perceiver_model import PerceiverResampler
 from training import train_model
-from visualization import plot_physio_reconstructions, plot_training_history
+from visualization import (
+    plot_physio_reconstructions,
+    plot_training_history,
+    plot_modality_dropout_reconstructions,
+)
 from run_logger import create_run_logger
 
 
@@ -488,6 +492,23 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"Warning: failed to plot reconstructions ({exc})")
+
+        # Plot modality dropout reconstructions
+        try:
+            modality_dropout_path = recon_fig_path.replace(
+                "physio_recon.png", "modality_dropout_recon.png"
+            )
+            print(f"Saving modality dropout plot to {modality_dropout_path}...")
+            plot_modality_dropout_reconstructions(
+                model,
+                plot_dataset,
+                device,
+                max_samples=4,
+                save_path=modality_dropout_path,
+                feature_names=feature_names,
+            )
+        except Exception as exc:
+            print(f"Warning: failed to plot modality dropout reconstructions ({exc})")
 
     # =========================================================================
     # Checkpoint saving

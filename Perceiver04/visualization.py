@@ -168,3 +168,148 @@ def plot_training_history(
     plt.close(fig)
 
     return save_path
+
+
+def plot_modality_dropout_reconstructions(
+    model: torch.nn.Module,
+    dataset,
+    device: torch.device,
+    *,
+    sample_indices: Optional[Iterable[int]] = None,
+    max_samples: int = 4,
+    save_path: str = "modality_dropout_recon.png",
+    feature_names: Optional[Sequence[str]] = None,
+) -> Path:
+    """
+    Render reconstructions with modality dropout for each modality.
+
+    For each sample, shows:
+    - Full input (all modalities)
+    - Reconstruction with each modality dropped one at a time
+
+    Useful for analyzing model robustness to missing modalities.
+
+    Args:
+        model: The model (should be in eval mode)
+        dataset: Dataset to sample from
+        device: Device to run inference on
+        sample_indices: Specific indices to plot (optional)
+        max_samples: Maximum number of samples to show
+        save_path: Where to save the figure
+        feature_names: Names for each channel/modality (optional)
+
+    Returns:
+        Path to saved figure
+    """
+    model.eval()
+    indices = select_indices(len(dataset), sample_indices, max_samples)
+
+    if not indices:
+        raise ValueError("No samples available for plotting")
+
+    first_sample = dataset[indices[0]]
+    num_channels = first_sample["physio"].shape[1]
+    names = resolve_feature_names(num_channels, feature_names)
+
+    # Number of scenarios: 1 (full) + num_channels (each dropped)
+    num_scenarios = num_channels + 1
+    rows = len(indices)
+    cols = num_scenarios
+
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), sharex=False)
+    if rows == 1:
+        axes = axes.reshape(1, -1)
+
+    with torch.no_grad():
+        for row, idx in enumerate(indices):
+            sample = dataset[idx]
+            physio = sample["physio"].unsqueeze(0).to(device)  # (1, seq_len, channels)
+            time = range(physio.shape[1])
+
+            # Full reconstruction (no dropout)
+            ax = axes[row, 0]
+            full_recon = model(physio).cpu().squeeze(0)
+            target = physio.cpu().squeeze(0)
+
+            for feat in range(num_channels):
+                ax.plot(
+                    time,
+                    target[:, feat],
+                    label=f"{names[feat]} (gt)",
+                    linewidth=1.5,
+                )
+                ax.plot(
+                    time,
+                    full_recon[:, feat],
+                    linestyle="--",
+                    label=f"{names[feat]} (recon)",
+                    linewidth=1.2,
+                    alpha=0.8,
+                )
+
+            ax.set_title(f"Sample {idx}: Full (all modalities)")
+            ax.set_xlabel("Sample index")
+            ax.set_ylabel("Signal value")
+            ax.legend(loc="best", fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+            # Reconstructions with each modality dropped
+            for dropped_feat in range(num_channels):
+                ax = axes[row, dropped_feat + 1]
+
+                # Create input with one modality dropped
+                physio_dropped = physio.clone()
+                physio_dropped[:, :, dropped_feat] = 0.0
+
+                recon_dropped = model(physio_dropped).cpu().squeeze(0)
+
+                # Plot all channels
+                for feat in range(num_channels):
+                    if feat == dropped_feat:
+                        # Show the input as zero (dropped modality)
+                        ax.plot(
+                            time,
+                            target[:, feat],
+                            label=f"{names[feat]} (dropped input)",
+                            linewidth=1.5,
+                            alpha=0.3,
+                            linestyle=":",
+                        )
+                        ax.plot(
+                            time,
+                            recon_dropped[:, feat],
+                            linestyle="--",
+                            label=f"{names[feat]} (recon w/o input)",
+                            linewidth=1.2,
+                            alpha=0.8,
+                            color="red",
+                        )
+                    else:
+                        ax.plot(
+                            time,
+                            target[:, feat],
+                            label=f"{names[feat]} (gt)",
+                            linewidth=1.5,
+                        )
+                        ax.plot(
+                            time,
+                            recon_dropped[:, feat],
+                            linestyle="--",
+                            label=f"{names[feat]} (recon)",
+                            linewidth=1.2,
+                            alpha=0.8,
+                        )
+
+                ax.set_title(f"Sample {idx}: {names[dropped_feat]} dropped")
+                ax.set_xlabel("Sample index")
+                ax.set_ylabel("Signal value")
+                ax.legend(loc="best", fontsize=7)
+                ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=100)
+    plt.close(fig)
+
+    return save_path
