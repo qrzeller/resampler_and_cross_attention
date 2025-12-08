@@ -223,7 +223,7 @@ class PerceiverResampler(nn.Module):
         self.output_proj = nn.Linear(latent_dim, signal_dim)
 
     def forward(
-        self, series: torch.Tensor, return_latents: bool = False
+        self, series: torch.Tensor, return_latents: bool = False, residual_base: Optional[torch.Tensor] = None
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through the Perceiver.
@@ -231,6 +231,10 @@ class PerceiverResampler(nn.Module):
         Args:
             series: (batch, seq_len, signal_dim) input signals
             return_latents: If True, return (outputs, latents) tuple
+            residual_base: (batch, seq_len, signal_dim) optional base for residual connection.
+                          If provided and use_residual=True, output will be delta + residual_base.
+                          This allows using the original unmasked input as residual base during training
+                          with modality dropout.
 
         Returns:
             outputs: (batch, decoder_seq_len, signal_dim) reconstructions
@@ -263,11 +267,14 @@ class PerceiverResampler(nn.Module):
         decoded = self.decoder_cross(queries, latents)
 
         delta = self.output_proj(decoded)
-        outputs = (
-            delta + series
-            if (self.use_residual and self.decoder_seq_len == self.seq_len)
-            else delta
-        )
+        
+        # Use residual connection if enabled
+        if self.use_residual and self.decoder_seq_len == self.seq_len:
+            # Use provided residual_base if available, otherwise use input series
+            base = residual_base if residual_base is not None else series
+            outputs = delta + base
+        else:
+            outputs = delta
 
         if return_latents:
             return outputs, latents

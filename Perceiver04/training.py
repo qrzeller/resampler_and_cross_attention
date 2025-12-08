@@ -19,6 +19,7 @@ def masked_reconstruction_loss(
     targets: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     diff_weight: float = 0.2,
+    modality_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, int]:
     """
     Compute masked reconstruction loss with optional first-difference term.
@@ -32,6 +33,7 @@ def masked_reconstruction_loss(
         targets: (batch, seq_len, channels) target signals
         mask: (batch,) boolean mask indicating valid samples
         diff_weight: Weight for first-difference loss term (0.0 to disable)
+        modality_mask: (batch, 1, channels) mask for modality dropout (1=dropped, 0=kept)
 
     Returns:
         loss: Scalar loss value
@@ -40,7 +42,17 @@ def masked_reconstruction_loss(
     # Reconstruction loss: was L1 (mean absolute error)
     # l1 = F.l1_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
     # Switched to Huber loss for smoother robustness
-    l1 = F.huber_loss(predictions, targets, reduction="none").mean(dim=(1, 2))
+    recon_loss = F.huber_loss(predictions, targets, reduction="none")  # (batch, seq_len, channels)
+    
+    # Apply modality mask: only compute loss on masked (dropped) channels
+    if modality_mask is not None:
+        recon_loss = recon_loss * modality_mask  # Zero out loss for unmasked channels
+        # Normalize by number of masked channels
+        num_masked = modality_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (batch, seq_len, 1)
+        l1 = recon_loss.sum(dim=-1) / num_masked.squeeze(-1)  # (batch, seq_len)
+        l1 = l1.mean(dim=1)  # (batch,)
+    else:
+        l1 = recon_loss.mean(dim=(1, 2))
 
     # First-difference loss (finite differences) - also L1
     if (
@@ -52,7 +64,17 @@ def masked_reconstruction_loss(
         dt = targets[:, 1:] - targets[:, :-1]
         # First-difference loss: was L1, now Huber for consistency
         # dl1 = F.l1_loss(dp, dt, reduction="none").mean(dim=(1, 2))
-        dl1 = F.huber_loss(dp, dt, reduction="none").mean(dim=(1, 2))
+        diff_loss = F.huber_loss(dp, dt, reduction="none")  # (batch, seq_len-1, channels)
+        
+        # Apply modality mask to diff loss as well
+        if modality_mask is not None:
+            diff_loss = diff_loss * modality_mask[:, :-1, :]  # Broadcast mask
+            num_masked = modality_mask[:, :-1, :].sum(dim=-1, keepdim=True).clamp(min=1.0)
+            dl1 = diff_loss.sum(dim=-1) / num_masked.squeeze(-1)  # (batch, seq_len-1)
+            dl1 = dl1.mean(dim=1)  # (batch,)
+        else:
+            dl1 = diff_loss.mean(dim=(1, 2))
+        
         per_sample = l1 + diff_weight * dl1
     else:
         per_sample = l1
@@ -104,13 +126,17 @@ def train_epoch(
                 torch.full((b, 1, c), keep_prob, device=physio.device)
             )
             physio_in = physio * mod_mask
+            # Create loss mask: 1 for dropped channels (where mod_mask=0), 0 for kept channels
+            loss_mask = 1.0 - mod_mask
         else:
             physio_in = physio
+            loss_mask = None
 
         optimizer.zero_grad(set_to_none=True)
-        recon = model(physio_in)
+        # Pass original physio as residual_base so residual connections use unmasked input
+        recon = model(physio_in, residual_base=physio)
         loss, valid = masked_reconstruction_loss(
-            recon, physio, mask=None, diff_weight=diff_weight
+            recon, physio, mask=None, diff_weight=diff_weight, modality_mask=loss_mask
         )
 
         if valid == 0:
@@ -164,12 +190,16 @@ def evaluate(
                     torch.full((b, 1, c), keep_prob, device=physio.device)
                 )
                 physio_in = physio * mod_mask
+                # Create loss mask: 1 for dropped channels, 0 for kept channels
+                loss_mask = 1.0 - mod_mask
             else:
                 physio_in = physio
+                loss_mask = None
 
-            recon = model(physio_in)
+            # Pass original physio as residual_base so residual connections use unmasked input
+            recon = model(physio_in, residual_base=physio)
             loss, valid = masked_reconstruction_loss(
-                recon, physio, mask=None, diff_weight=diff_weight
+                recon, physio, mask=None, diff_weight=diff_weight, modality_mask=loss_mask
             )
 
             if valid == 0:
