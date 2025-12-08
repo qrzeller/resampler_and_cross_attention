@@ -129,13 +129,17 @@ def train_epoch(
             physio_in = physio * mod_mask
             # Create loss mask: 1 for dropped channels (where mod_mask=0), 0 for kept channels
             loss_mask = 1.0 - mod_mask
+            
+            # Skip if no channels were dropped in this batch
+            if loss_mask.sum() == 0:
+                continue
         else:
             physio_in = physio
             loss_mask = None
 
         optimizer.zero_grad(set_to_none=True)
-        # Pass original physio as residual_base so residual connections use unmasked input
-        recon = model(physio_in, residual_base=physio)
+        # Use masked input as residual_base - model must predict full signal for dropped channels
+        recon = model(physio_in, residual_base=physio_in)
         loss, valid = masked_reconstruction_loss(
             recon, physio, mask=None, diff_weight=diff_weight, modality_mask=loss_mask
         )
@@ -193,12 +197,16 @@ def evaluate(
                 physio_in = physio * mod_mask
                 # Create loss mask: 1 for dropped channels, 0 for kept channels
                 loss_mask = 1.0 - mod_mask
+                
+                # Skip if no channels were dropped in this batch
+                if loss_mask.sum() == 0:
+                    continue
             else:
                 physio_in = physio
                 loss_mask = None
 
             # Pass original physio as residual_base so residual connections use unmasked input
-            recon = model(physio_in, residual_base=physio)
+            recon = model(physio_in, residual_base=physio_in)
             loss, valid = masked_reconstruction_loss(
                 recon, physio, mask=None, diff_weight=diff_weight, modality_mask=loss_mask
             )
