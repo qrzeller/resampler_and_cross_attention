@@ -68,8 +68,9 @@ def masked_reconstruction_loss(
         
         # Apply modality mask to diff loss as well
         if modality_mask is not None:
-            diff_loss = diff_loss * modality_mask[:, :-1, :]  # Broadcast mask
-            num_masked = modality_mask[:, :-1, :].sum(dim=-1, keepdim=True).clamp(min=1.0)
+            # modality_mask is (batch, 1, channels), broadcast to (batch, seq_len-1, channels)
+            diff_loss = diff_loss * modality_mask  # Broadcast mask across time dimension
+            num_masked = modality_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (batch, 1, 1)
             dl1 = diff_loss.sum(dim=-1) / num_masked.squeeze(-1)  # (batch, seq_len-1)
             dl1 = dl1.mean(dim=1)  # (batch,)
         else:
