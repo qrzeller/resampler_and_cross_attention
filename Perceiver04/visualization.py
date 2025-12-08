@@ -183,9 +183,8 @@ def plot_modality_dropout_reconstructions(
     """
     Render reconstructions with modality dropout for each modality.
 
-    For each sample, shows:
-    - Full input (all modalities)
-    - Reconstruction with each modality dropped one at a time
+    For each sample, shows only the dropped modality and its ground truth.
+    Each column represents a modality dropout scenario.
 
     Useful for analyzing model robustness to missing modalities.
 
@@ -211,12 +210,11 @@ def plot_modality_dropout_reconstructions(
     num_channels = first_sample["physio"].shape[1]
     names = resolve_feature_names(num_channels, feature_names)
 
-    # Number of scenarios: 1 (full) + num_channels (each dropped)
-    num_scenarios = num_channels + 1
+    # One column per modality dropout
     rows = len(indices)
-    cols = num_scenarios
+    cols = num_channels
 
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), sharex=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), sharex=False)
     if rows == 1:
         axes = axes.reshape(1, -1)
 
@@ -224,38 +222,12 @@ def plot_modality_dropout_reconstructions(
         for row, idx in enumerate(indices):
             sample = dataset[idx]
             physio = sample["physio"].unsqueeze(0).to(device)  # (1, seq_len, channels)
-            time = range(physio.shape[1])
-
-            # Full reconstruction (no dropout)
-            ax = axes[row, 0]
-            full_recon = model(physio).cpu().squeeze(0)
             target = physio.cpu().squeeze(0)
-
-            for feat in range(num_channels):
-                ax.plot(
-                    time,
-                    target[:, feat],
-                    label=f"{names[feat]} (gt)",
-                    linewidth=1.5,
-                )
-                ax.plot(
-                    time,
-                    full_recon[:, feat],
-                    linestyle="--",
-                    label=f"{names[feat]} (recon)",
-                    linewidth=1.2,
-                    alpha=0.8,
-                )
-
-            ax.set_title(f"Sample {idx}: Full (all modalities)")
-            ax.set_xlabel("Sample index")
-            ax.set_ylabel("Signal value")
-            ax.legend(loc="best", fontsize=7)
-            ax.grid(True, alpha=0.3)
+            time = range(target.shape[0])
 
             # Reconstructions with each modality dropped
             for dropped_feat in range(num_channels):
-                ax = axes[row, dropped_feat + 1]
+                ax = axes[row, dropped_feat]
 
                 # Create input with one modality dropped
                 physio_dropped = physio.clone()
@@ -263,53 +235,34 @@ def plot_modality_dropout_reconstructions(
 
                 recon_dropped = model(physio_dropped).cpu().squeeze(0)
 
-                # Plot all channels
-                for feat in range(num_channels):
-                    if feat == dropped_feat:
-                        # Show the input as zero (dropped modality)
-                        ax.plot(
-                            time,
-                            target[:, feat],
-                            label=f"{names[feat]} (dropped input)",
-                            linewidth=1.5,
-                            alpha=0.3,
-                            linestyle=":",
-                        )
-                        ax.plot(
-                            time,
-                            recon_dropped[:, feat],
-                            linestyle="--",
-                            label=f"{names[feat]} (recon w/o input)",
-                            linewidth=1.2,
-                            alpha=0.8,
-                            color="red",
-                        )
-                    else:
-                        ax.plot(
-                            time,
-                            target[:, feat],
-                            label=f"{names[feat]} (gt)",
-                            linewidth=1.5,
-                        )
-                        ax.plot(
-                            time,
-                            recon_dropped[:, feat],
-                            linestyle="--",
-                            label=f"{names[feat]} (recon)",
-                            linewidth=1.2,
-                            alpha=0.8,
-                        )
+                # Plot only the dropped modality
+                ax.plot(
+                    time,
+                    target[:, dropped_feat],
+                    label=f"{names[dropped_feat]} (ground truth)",
+                    linewidth=2.5,
+                    color="steelblue",
+                )
+                ax.plot(
+                    time,
+                    recon_dropped[:, dropped_feat],
+                    linestyle="--",
+                    label=f"{names[dropped_feat]} (reconstruction)",
+                    linewidth=2.0,
+                    alpha=0.9,
+                    color="red",
+                )
 
                 ax.set_title(f"Sample {idx}: {names[dropped_feat]} dropped")
                 ax.set_xlabel("Sample index")
                 ax.set_ylabel("Signal value")
-                ax.legend(loc="best", fontsize=7)
+                ax.legend(loc="best", fontsize=10)
                 ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, dpi=100)
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
     return save_path
