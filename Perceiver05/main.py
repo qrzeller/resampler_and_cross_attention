@@ -175,9 +175,9 @@ def parse_args() -> argparse.Namespace:
         help="Dropout probability (default: 0.05)",
     )
     parser.add_argument(
-        "--no-residual",
+        "--no-query-residual",
         action="store_true",
-        help="Disable residual decoding",
+        help="Disable query residual in decoder cross-attention (useful for raw input-space features)",
     )
 
     # Training parameters
@@ -424,7 +424,7 @@ def main() -> None:
         max_freq_hz=args.max_freq_hz,
         decoder_seq_len=args.decoder_len or seq_len,
         dropout=args.dropout,
-        use_residual=(not args.no_residual),
+        use_query_residual=(not args.no_query_residual),
     ).to(device)
 
     # Count parameters
@@ -434,7 +434,7 @@ def main() -> None:
     print(f"  Num latents: {args.num_latents}")
     print(f"  Self-attn layers: {args.self_layers}")
     print(f"  Dropout: {args.dropout}")
-    print(f"  Residual: {'enabled' if not args.no_residual else 'disabled'}")
+    print(f"  Query residual: {'enabled' if not args.no_query_residual else 'disabled'}")
     print()
 
     # =========================================================================

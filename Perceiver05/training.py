@@ -142,8 +142,7 @@ def train_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         # Pass channel_mask so model uses learnable mask tokens for dropped channels
-        # Use masked input as residual_base - model must predict full signal for dropped channels
-        recon = model(physio_in, residual_base=physio_in, channel_mask=channel_mask)
+        recon = model(physio_in, channel_mask=channel_mask)
         loss, valid = masked_reconstruction_loss(
             recon, physio, mask=None, diff_weight=diff_weight, modality_mask=loss_mask
         )
@@ -212,7 +211,7 @@ def evaluate(
                 loss_mask = None
 
             # Pass channel_mask so model uses learnable mask tokens for dropped channels
-            recon = model(physio_in, residual_base=physio_in, channel_mask=channel_mask)
+            recon = model(physio_in, channel_mask=channel_mask)
             loss, valid = masked_reconstruction_loss(
                 recon, physio, mask=None, diff_weight=diff_weight, modality_mask=loss_mask
             )

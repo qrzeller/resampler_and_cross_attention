@@ -30,7 +30,14 @@ class FeedForward(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    """Cross-attention block: latents attend to input tokens."""
+    """
+    Cross-attention block: latents attend to input tokens.
+    
+    Perceiver IO style (pre-norm):
+    X = Attn(LN(XQ), LN(XKV))
+    X = X + XQ (query residual)
+    X = X + MLP(LN(X))
+    """
 
     def __init__(
         self,
@@ -40,6 +47,8 @@ class CrossAttentionBlock(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        self.norm_q = nn.LayerNorm(latent_dim)
+        self.norm_kv = nn.LayerNorm(input_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=latent_dim,
             num_heads=num_heads,
@@ -48,9 +57,8 @@ class CrossAttentionBlock(nn.Module):
             vdim=input_dim,
             dropout=dropout,
         )
+        self.norm_mlp = nn.LayerNorm(latent_dim)
         self.ff = FeedForward(latent_dim, dropout=dropout)
-        self.norm1 = nn.LayerNorm(latent_dim)
-        self.norm2 = nn.LayerNorm(latent_dim)
 
     def forward(
         self,
@@ -60,38 +68,53 @@ class CrossAttentionBlock(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            latents: (batch, num_latents, latent_dim)
-            tokens: (batch, seq_len, input_dim)
+            latents: (batch, num_latents, latent_dim) - queries
+            tokens: (batch, seq_len, input_dim) - keys/values
             mask: Optional attention mask
 
         Returns:
             Updated latents (batch, num_latents, latent_dim)
         """
-        attn_out, _ = self.attn(latents, tokens, tokens, key_padding_mask=mask)
-        latents = self.norm1(latents + attn_out)
-        latents = self.norm2(latents + self.ff(latents))
+        # Pre-norm cross-attention with query residual
+        q_normed = self.norm_q(latents)
+        kv_normed = self.norm_kv(tokens)
+        attn_out, _ = self.attn(q_normed, kv_normed, kv_normed, key_padding_mask=mask)
+        latents = latents + attn_out  # Query residual
+        
+        # Pre-norm MLP with residual
+        latents = latents + self.ff(self.norm_mlp(latents))
         return latents
 
 
 class DecoderCrossAttentionBlock(nn.Module):
-    """Decoder cross-attention: queries attend to latent array."""
+    """
+    Decoder cross-attention: queries attend to latent array.
+    
+    Perceiver IO style (pre-norm), with optional query residual:
+    X = Attn(LN(XQ), LN(XKV))
+    X = X + XQ (optional query residual - often dropped for raw input-space queries)
+    X = X + MLP(LN(X))
+    """
 
     def __init__(
         self,
         latent_dim: int,
         num_heads: int,
         dropout: float = 0.0,
+        use_query_residual: bool = True,
     ) -> None:
         super().__init__()
+        self.use_query_residual = use_query_residual
+        self.norm_q = nn.LayerNorm(latent_dim)
+        self.norm_kv = nn.LayerNorm(latent_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=latent_dim,
             num_heads=num_heads,
             batch_first=True,
             dropout=dropout,
         )
+        self.norm_mlp = nn.LayerNorm(latent_dim)
         self.ff = FeedForward(latent_dim, dropout=dropout)
-        self.norm1 = nn.LayerNorm(latent_dim)
-        self.norm2 = nn.LayerNorm(latent_dim)
 
     def forward(
         self,
@@ -106,22 +129,33 @@ class DecoderCrossAttentionBlock(nn.Module):
         Returns:
             Updated queries (batch, seq_len, latent_dim)
         """
-        attn_out, _ = self.attn(queries, latents, latents)
-        queries = self.norm1(queries + attn_out)
-        queries = self.norm2(queries + self.ff(queries))
+        # Pre-norm cross-attention with optional query residual
+        q_normed = self.norm_q(queries)
+        kv_normed = self.norm_kv(latents)
+        attn_out, _ = self.attn(q_normed, kv_normed, kv_normed)
+        
+        if self.use_query_residual:
+            queries = queries + attn_out  # Query residual
+        else:
+            queries = attn_out  # No residual (for raw input-space features)
+        
+        # Pre-norm MLP with residual
+        queries = queries + self.ff(self.norm_mlp(queries))
         return queries
 
 
 class PerceiverResampler(nn.Module):
     """
-    Minimal Perceiver IO-style autoencoder for time-series.
+    Perceiver IO-style autoencoder for time-series with masked autoencoding support.
 
-    Architecture:
-    1. Input signals -> project to latent_dim with Fourier features
-    2. Cross-attention: latents attend to input tokens
-    3. Self-attention: latents process among themselves
-    4. Decoder cross-attention: reconstruction queries attend to latents
-    5. Output projection to signal space (optionally residual)
+    Architecture (Perceiver IO paper):
+    1. Encoder cross-attention: latents attend to input tokens (with residuals)
+    2. L × self-attention layers on latents (with residuals)
+    3. Decoder cross-attention: queries attend to latents (optional query residual)
+    4. Output projection to signal space
+
+    All attention blocks use pre-norm + residual connections (GPT-2 style).
+    No final skip connection from input to output - reconstruction is purely from latents.
 
     Args:
         signal_dim: Number of signal channels (e.g., 5 for ECG, GSR, etc.)
@@ -136,7 +170,8 @@ class PerceiverResampler(nn.Module):
         min_freq_hz: Minimum frequency in Hz (default: ~1/window_duration)
         decoder_seq_len: Length of decoder output (default: same as seq_len)
         dropout: Dropout probability
-        use_residual: Whether to use residual decoding (predict delta + input)
+        use_query_residual: Whether decoder uses query residual (True for latent queries,
+                           False for raw input-space features like optical flow)
     """
 
     def __init__(
@@ -153,13 +188,13 @@ class PerceiverResampler(nn.Module):
         min_freq_hz: Optional[float] = None,
         decoder_seq_len: Optional[int] = None,
         dropout: float = 0.05,
-        use_residual: bool = True,
+        use_query_residual: bool = True,
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
         self.decoder_seq_len = int(decoder_seq_len or seq_len)
         self.sample_rate_hz = float(sample_rate_hz)
-        self.use_residual = bool(use_residual)
+        self.use_query_residual = bool(use_query_residual)
 
         # Duration covered by indexed samples [0 .. seq_len-1] at sample_rate_hz
         self.window_duration_sec = (self.seq_len - 1) / max(self.sample_rate_hz, 1e-6)
@@ -223,14 +258,15 @@ class PerceiverResampler(nn.Module):
 
         # Decoder path
         self.query_proj = nn.Linear(self.decoder_pos.output_dim, latent_dim)
-        self.decoder_cross = DecoderCrossAttentionBlock(latent_dim, num_heads, dropout)
+        self.decoder_cross = DecoderCrossAttentionBlock(
+            latent_dim, num_heads, dropout, use_query_residual=use_query_residual
+        )
         self.output_proj = nn.Linear(latent_dim, signal_dim)
 
     def forward(
         self, 
         series: torch.Tensor, 
         return_latents: bool = False, 
-        residual_base: Optional[torch.Tensor] = None,
         channel_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -239,10 +275,6 @@ class PerceiverResampler(nn.Module):
         Args:
             series: (batch, seq_len, signal_dim) input signals
             return_latents: If True, return (outputs, latents) tuple
-            residual_base: (batch, seq_len, signal_dim) optional base for residual connection.
-                          If provided and use_residual=True, output will be delta + residual_base.
-                          This allows using the original unmasked input as residual base during training
-                          with modality dropout.
             channel_mask: (batch, 1, signal_dim) binary mask where 1=keep channel, 0=use mask token.
                          Used for modality dropout - dropped channels are replaced with learnable mask token.
 
@@ -270,6 +302,7 @@ class PerceiverResampler(nn.Module):
         tokens = self.input_proj(tokens)
 
         # Encoder: cross-attention + self-attention on latents
+        # All residuals are handled within the attention blocks
         latents = self.latents.unsqueeze(0).expand(batch, -1, -1)
         latents = self.encoder_cross(latents, tokens)
         for layer in self.self_layers:
@@ -283,15 +316,9 @@ class PerceiverResampler(nn.Module):
         queries = self.query_proj(dec_features)
         decoded = self.decoder_cross(queries, latents)
 
-        delta = self.output_proj(decoded)
-        
-        # Use residual connection if enabled
-        if self.use_residual and self.decoder_seq_len == self.seq_len:
-            # Use provided residual_base if available, otherwise use input series
-            base = residual_base if residual_base is not None else series
-            outputs = delta + base
-        else:
-            outputs = delta
+        # Direct output projection (no final skip connection)
+        # All residuals are within attention blocks, not input-to-output
+        outputs = self.output_proj(decoded)
 
         if return_latents:
             return outputs, latents
