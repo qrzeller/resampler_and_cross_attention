@@ -24,9 +24,9 @@ def random_patch_mask(
         device: Device to create mask on
     
     Returns:
-        mask: (batch, num_patches, num_channels) binary mask (1=visible, 0=masked)
+        mask: (batch, num_patches, num_channels) binary mask (1=masked, 0=visible)
     """
-    mask = torch.rand(batch_size, num_patches, num_channels, device=device) > mask_ratio
+    mask = torch.rand(batch_size, num_patches, num_channels, device=device) < mask_ratio
     return mask.float()
 
 
@@ -56,9 +56,9 @@ def span_mask(
         device: Device to create mask on
     
     Returns:
-        mask: (batch, num_patches, num_channels) binary mask (1=visible, 0=masked)
+        mask: (batch, num_patches, num_channels) binary mask (1=masked, 0=visible)
     """
-    mask = torch.ones(batch_size, num_patches, num_channels, device=device)
+    mask = torch.zeros(batch_size, num_patches, num_channels, device=device)
     
     for b in range(batch_size):
         for c in range(num_channels):
@@ -72,9 +72,9 @@ def span_mask(
                 # Random start position
                 start = torch.randint(0, max(1, num_patches - span_len + 1), (1,)).item()
                 
-                # Mask the span
+                # Mask the span (set to 1)
                 end = min(start + span_len, num_patches)
-                mask[b, start:end, c] = 0
+                mask[b, start:end, c] = 1
                 masked_count += (end - start)
                 
                 # Safety: avoid infinite loop
@@ -105,13 +105,13 @@ def channel_drop_mask(
         device: Device to create mask on
     
     Returns:
-        mask: (batch, num_patches, num_channels) binary mask (1=visible, 0=masked)
+        mask: (batch, num_patches, num_channels) binary mask (1=masked/dropped, 0=visible)
     """
-    # Sample which channels to keep: (batch, 1, num_channels)
-    channel_keep = torch.rand(batch_size, 1, num_channels, device=device) > drop_prob
+    # Sample which channels to drop: (batch, 1, num_channels)
+    channel_drop = torch.rand(batch_size, 1, num_channels, device=device) < drop_prob
     
     # Broadcast to all patches
-    mask = channel_keep.expand(-1, num_patches, -1).float()
+    mask = channel_drop.expand(-1, num_patches, -1).float()
     
     return mask
 
@@ -145,7 +145,7 @@ def mixed_mask(
         device: Device to create mask on
     
     Returns:
-        mask: (batch, num_patches, num_channels) binary mask (1=visible, 0=masked)
+        mask: (batch, num_patches, num_channels) binary mask (1=masked, 0=visible)
     """
     # Start with channel dropout
     mask = channel_drop_mask(batch_size, num_patches, num_channels, channel_drop_prob, device)
@@ -153,16 +153,18 @@ def mixed_mask(
     # For each sample, decide span vs random
     for b in range(batch_size):
         if torch.rand(1).item() < span_prob:
-            # Span masking on kept channels
+            # Span masking on kept (visible) channels
             for c in range(num_channels):
-                if mask[b, 0, c] > 0:  # Channel not dropped
+                if mask[b, 0, c] == 0:  # Channel not dropped (visible)
                     # Apply span mask to this channel
                     span_m = span_mask(1, num_patches, 1, mask_ratio, min_span_len, max_span_len, device)
-                    mask[b, :, c] *= span_m[0, :, 0]
+                    # Combine: channel is masked if either dropped OR span-masked
+                    mask[b, :, c] = torch.maximum(mask[b, :, c], span_m[0, :, 0])
         else:
             # Random patch masking on kept channels
             random_m = random_patch_mask(1, num_patches, num_channels, mask_ratio, device)
-            mask[b] *= random_m[0]
+            # Combine: channel is masked if either dropped OR random-masked
+            mask[b] = torch.maximum(mask[b], random_m[0])
     
     return mask
 
@@ -171,7 +173,7 @@ def get_mask(
     batch_size: int,
     num_patches: int,
     num_channels: int,
-    strategy: str = 'span',
+    mask_type: str = 'mixed',
     mask_ratio: float = 0.5,
     device: torch.device = None,
     **kwargs,
@@ -183,24 +185,25 @@ def get_mask(
         batch_size: Batch size
         num_patches: Number of patches per channel
         num_channels: Number of channels
-        strategy: 'random', 'span', 'channel_drop', or 'mixed'
+        mask_type: 'random', 'span', 'channel_drop', or 'mixed'
         mask_ratio: Masking ratio
         device: Device
         **kwargs: Additional args for specific strategies
     
     Returns:
-        mask: (batch, num_patches, num_channels) binary mask
+        mask: (batch, num_patches, num_channels) binary mask (1=masked, 0=visible)
     """
-    if strategy == 'random':
+    if mask_type == 'random':
         return random_patch_mask(batch_size, num_patches, num_channels, mask_ratio, device)
-    elif strategy == 'span':
+    elif mask_type == 'span':
         return span_mask(batch_size, num_patches, num_channels, mask_ratio, 
-                        kwargs.get('min_span_len', 2), kwargs.get('max_span_len', 8), device)
-    elif strategy == 'channel_drop':
-        return channel_drop_mask(batch_size, num_patches, num_channels, mask_ratio, device)
-    elif strategy == 'mixed':
+                        kwargs.get('span_len_min', 2), kwargs.get('span_len_max', 8), device)
+    elif mask_type == 'channel_drop':
+        return channel_drop_mask(batch_size, num_patches, num_channels, 
+                               kwargs.get('channel_drop_prob', mask_ratio), device)
+    elif mask_type == 'mixed':
         return mixed_mask(batch_size, num_patches, num_channels, mask_ratio,
                          kwargs.get('channel_drop_prob', 0.2), kwargs.get('span_prob', 0.7),
-                         kwargs.get('min_span_len', 2), kwargs.get('max_span_len', 8), device)
+                         kwargs.get('span_len_min', 2), kwargs.get('span_len_max', 8), device)
     else:
-        raise ValueError(f"Unknown mask strategy: {strategy}")
+        raise ValueError(f"Unknown mask type: {mask_type}")

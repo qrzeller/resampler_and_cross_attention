@@ -266,3 +266,105 @@ def plot_modality_dropout_reconstructions(
     plt.close(fig)
 
     return save_path
+
+
+def plot_unmasked_reconstructions(
+    model: torch.nn.Module,
+    dataset,
+    device: torch.device,
+    *,
+    sample_indices: Optional[Iterable[int]] = None,
+    max_samples: int = 4,
+    save_path: str = "unmasked_recon.png",
+    feature_names: Optional[Sequence[str]] = None,
+) -> Path:
+    """
+    Render full unmasked reconstructions (standard autoencoding, no masking).
+    
+    Shows all modalities/channels side-by-side with ground truth overlaid.
+    Unlike modality dropout plots, this passes complete input without any masking.
+    
+    Useful for evaluating overall reconstruction quality without masked modeling.
+
+    Args:
+        model: The model (should be in eval mode)
+        dataset: Dataset to sample from
+        device: Device to run inference on
+        sample_indices: Specific indices to plot (optional)
+        max_samples: Maximum number of samples to show
+        save_path: Where to save the figure
+        feature_names: Names for each channel (optional)
+
+    Returns:
+        Path to saved figure
+    """
+    model.eval()
+    indices = select_indices(len(dataset), sample_indices, max_samples)
+
+    if not indices:
+        raise ValueError("No samples available for plotting")
+
+    first_sample = dataset[indices[0]]
+    num_channels = first_sample["physio"].shape[1]
+    names = resolve_feature_names(num_channels, feature_names)
+
+    # One row per sample, one column per channel
+    rows = len(indices)
+    cols = num_channels
+
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 3 * rows), sharex=False)
+    if rows == 1 and cols == 1:
+        axes = [[axes]]
+    elif rows == 1:
+        axes = [axes]
+    elif cols == 1:
+        axes = [[ax] for ax in axes]
+
+    with torch.no_grad():
+        for row, idx in enumerate(indices):
+            sample = dataset[idx]
+            physio = sample["physio"].unsqueeze(0).to(device)  # (1, seq_len, channels)
+            
+            # Forward pass WITHOUT masking (patch_mask=None)
+            recon = model(physio, patch_mask=None).cpu().squeeze(0)
+            target = physio.cpu().squeeze(0)
+            time = range(target.shape[0])
+
+            for col in range(num_channels):
+                ax = axes[row][col]
+                
+                # Plot ground truth
+                ax.plot(
+                    time,
+                    target[:, col],
+                    label="Ground truth",
+                    linewidth=2.0,
+                    color="steelblue",
+                    alpha=0.8,
+                )
+                
+                # Plot reconstruction
+                ax.plot(
+                    time,
+                    recon[:, col],
+                    linestyle="--",
+                    label="Reconstruction",
+                    linewidth=1.8,
+                    color="orange",
+                    alpha=0.9,
+                )
+
+                ax.set_title(f"Sample {idx}: {names[col]}")
+                ax.set_xlabel("Sample index")
+                ax.set_ylabel("Signal value")
+                ax.legend(loc="best", fontsize=9)
+                ax.grid(True, alpha=0.3)
+
+    fig.suptitle("Unmasked Reconstruction (Full Autoencoding)", fontsize=14, y=1.00)
+    fig.tight_layout()
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    return save_path

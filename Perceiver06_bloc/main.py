@@ -42,6 +42,7 @@ from visualization import (
     plot_physio_reconstructions,
     plot_training_history,
     plot_modality_dropout_reconstructions,
+    plot_unmasked_reconstructions,
 )
 from run_logger import create_run_logger
 
@@ -185,8 +186,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patch-len",
         type=int,
-        default=64,
-        help="Patch length in samples (default: 64). seq_len must be divisible by this.",
+        default=50,
+        help="Patch length in samples (default: 50 for 600-sample windows). seq_len must be divisible by this.",
     )
     parser.add_argument(
         "--use-conv-frontend",
@@ -464,16 +465,15 @@ def main() -> None:
     # =========================================================================
     print("Creating model...")
     model = PatchPerceiverAutoencoder(
-        patch_len=args.patch_len,
-        num_channels=num_signals,
+        signal_dim=num_signals,
+        seq_len=seq_len,
         sample_rate_hz=args.target_fs,
-        d_model=args.latent_dim,
+        patch_len=args.patch_len,
+        latent_dim=args.latent_dim,
         num_latents=args.num_latents,
         num_self_attn_layers=args.self_layers,
         num_heads=args.num_heads,
         num_fourier_bands=args.fourier_bands,
-        min_freq_hz=args.min_freq_hz,
-        max_freq_hz=args.max_freq_hz,
         dropout=args.dropout,
         use_conv_frontend=args.use_conv_frontend,
         mask_strategy=args.mask_strategy,
@@ -575,6 +575,23 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"Warning: failed to plot modality dropout reconstructions ({exc})")
+        
+        # Plot unmasked reconstructions
+        try:
+            unmasked_path = recon_fig_path.replace(
+                "physio_recon.png", "unmasked_recon.png"
+            )
+            print(f"Saving unmasked reconstruction plot to {unmasked_path}...")
+            plot_unmasked_reconstructions(
+                model,
+                plot_dataset,
+                device,
+                max_samples=4,
+                save_path=unmasked_path,
+                feature_names=feature_names,
+            )
+        except Exception as exc:
+            print(f"Warning: failed to plot unmasked reconstructions ({exc})")
 
     # =========================================================================
     # Checkpoint saving

@@ -9,7 +9,7 @@ python Perceiver06_bloc/main.py --use-eatmint --epochs 20 --batch-size 8
 
 ## Default Configuration
 
-- **Patch length**: 64 samples (1.28s at 50Hz)
+- **Patch length**: 50 samples (1.0s at 50Hz, gives 12 patches for 600-sample windows)
 - **Masking strategy**: MAE (remove masked patches from encoder)
 - **Mask type**: mixed (combines span + channel drop)
 - **Mask ratio**: 0.5 (50% of patches masked)
@@ -19,10 +19,11 @@ python Perceiver06_bloc/main.py --use-eatmint --epochs 20 --batch-size 8
 ## Key Arguments
 
 ### Patch Configuration
-- `--patch-len SAMPLES`: Samples per patch (default: 64)
+- `--patch-len SAMPLES`: Samples per patch (default: 50)
+  - Must divide evenly into window size (600 samples @ 50Hz = 12s window)
+  - Good values for 600 samples: 25, 30, 50, 60, 75, 100
   - Smaller = more tokens, finer granularity
   - Larger = fewer tokens, faster training
-  - Must divide evenly into window size
 
 - `--use-conv-frontend`: Use 1D convolution for patch tokenization
   - Default: linear projection
@@ -85,13 +86,13 @@ python Perceiver06_bloc/main.py --use-eatmint --epochs 50 \
 ### BERT-style masking with smaller patches
 ```bash
 python Perceiver06_bloc/main.py --use-eatmint --epochs 50 \
-    --patch-len 32 --mask-strategy bert --mask-ratio 0.15
+    --patch-len 30 --mask-strategy bert --mask-ratio 0.15
 ```
 
 ### Convolutional frontend with larger patches
 ```bash
 python Perceiver06_bloc/main.py --use-eatmint --epochs 50 \
-    --use-conv-frontend --patch-len 128
+    --use-conv-frontend --patch-len 100
 ```
 
 ## Output Structure
@@ -114,6 +115,7 @@ The model uses:
    - Fourier time embeddings
    - Modality embeddings (ECG, GSR, BVP, TEMP, ACC)
    - Channel embeddings
+   - Default: 600 samples / 50 samples per patch = 12 patches per channel
 
 2. **Encoder**: Cross-attention + self-attention layers
    - Query: learnable latent tokens

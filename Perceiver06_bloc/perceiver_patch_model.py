@@ -56,6 +56,7 @@ class CrossAttentionBlock(nn.Module):
             vdim=input_dim,
             dropout=dropout,
         )
+        self.dropout = nn.Dropout(dropout)  # Residual path dropout
         self.norm_mlp = nn.LayerNorm(latent_dim)
         self.ff = FeedForward(latent_dim, dropout=dropout)
 
@@ -69,7 +70,7 @@ class CrossAttentionBlock(nn.Module):
         q_normed = self.norm_q(latents)
         kv_normed = self.norm_kv(tokens)
         attn_out, _ = self.attn(q_normed, kv_normed, kv_normed, key_padding_mask=mask)
-        latents = latents + attn_out
+        latents = latents + self.dropout(attn_out)
         
         # Pre-norm MLP with residual
         latents = latents + self.ff(self.norm_mlp(latents))
@@ -99,6 +100,7 @@ class DecoderCrossAttentionBlock(nn.Module):
             batch_first=True,
             dropout=dropout,
         )
+        self.dropout = nn.Dropout(dropout)  # Residual path dropout
         self.norm_mlp = nn.LayerNorm(latent_dim)
         self.ff = FeedForward(latent_dim, dropout=dropout)
 
@@ -113,9 +115,9 @@ class DecoderCrossAttentionBlock(nn.Module):
         attn_out, _ = self.attn(q_normed, kv_normed, kv_normed)
         
         if self.use_query_residual:
-            queries = queries + attn_out
+            queries = queries + self.dropout(attn_out)
         else:
-            queries = attn_out
+            queries = self.dropout(attn_out)
         
         # Pre-norm MLP with residual
         queries = queries + self.ff(self.norm_mlp(queries))
@@ -191,9 +193,11 @@ class PatchPerceiverAutoencoder(nn.Module):
         self.latent_dim = latent_dim
         self.mask_strategy = mask_strategy
         
-        # Calculate number of patches
-        self.num_patches = seq_len // patch_len
+        # Validate seq_len is divisible by patch_len (for non-overlapping patches)
         assert seq_len % patch_len == 0, f"seq_len ({seq_len}) must be divisible by patch_len ({patch_len})"
+        
+        # Validate modality assignments
+        assert signal_dim <= num_modalities, f"signal_dim ({signal_dim}) must be <= num_modalities ({num_modalities})"
         
         # Patch tokenizer
         self.tokenizer = PatchTokenizer(
@@ -201,7 +205,7 @@ class PatchPerceiverAutoencoder(nn.Module):
             num_channels=signal_dim,
             d_model=latent_dim,
             num_modalities=num_modalities,
-            max_channels_per_modality=max_channels_per_modality,
+            max_channels_per_modality=signal_dim,  # CRITICAL: Must fit all channel IDs
             use_conv_frontend=use_conv_frontend,
             dropout=dropout,
         )
@@ -213,13 +217,16 @@ class PatchPerceiverAutoencoder(nn.Module):
         # Time encoding with Fourier features
         # Fourier features encode time t as: [t, sin(2π f₁ t), cos(2π f₁ t), ..., sin(2π fₖ t), cos(2π fₖ t)]
         # where frequencies f₁...fₖ are log-spaced between min_freq_hz and max_freq_hz
-        # This provides position-aware encoding that works well for continuous time
+        # CRITICAL: max_freq must respect patch token rate, not raw sample rate
+        # Patches are spaced by Δt = patch_len / sample_rate_hz
+        # Max representable frequency across tokens: f_max ≈ 1 / (2 * Δt) = sample_rate / (2 * patch_len)
         window_duration = (seq_len - 1) / sample_rate_hz
+        token_rate = sample_rate_hz / patch_len  # Effective sampling rate of patch centers
         self.time_encoder = FourierFeatures(
             num_fourier_bands,
-            min_freq_hz=1.0 / window_duration,  # Captures slow trends over window
-            max_freq_hz=sample_rate_hz / 2.0,    # Nyquist frequency
-            include_positions=True,               # Include raw time t
+            min_freq_hz=1.0 / window_duration,    # Captures slow trends over window
+            max_freq_hz=0.5 * token_rate,          # Nyquist for patch tokens, NOT raw samples
+            include_positions=True,                 # Include raw time t
         )
         
         # Project Fourier features to latent_dim
@@ -232,7 +239,7 @@ class PatchPerceiverAutoencoder(nn.Module):
         # Encoder cross-attention
         self.encoder_cross = CrossAttentionBlock(latent_dim, latent_dim, num_heads, dropout)
         
-        # Self-attention layers on latents
+        # Self-attention layers on latents (pre-norm for stability)
         self.self_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=latent_dim,
@@ -241,6 +248,7 @@ class PatchPerceiverAutoencoder(nn.Module):
                 batch_first=True,
                 activation="gelu",
                 dropout=dropout,
+                norm_first=True,  # CRITICAL: pre-norm for Perceiver IO style
             )
             for _ in range(num_self_attn_layers)
         ])
@@ -275,8 +283,9 @@ class PatchPerceiverAutoencoder(nn.Module):
         Args:
             signals: (batch, seq_len, signal_dim) input signals
             patch_mask: (batch, num_patches, signal_dim) binary mask where:
-                       - 1 = visible patch (keep in encoder)
-                       - 0 = masked patch (reconstruct from latents)
+                       - 1 = masked patch (reconstruct from latents) - LOSS COMPUTED HERE
+                       - 0 = visible patch (provided to encoder) - no loss
+                       Convention: loss on MASKED (1), not visible (0)
                        If None, no masking (standard autoencoding)
             return_latents: If True, return (output, latents) tuple
         
@@ -289,6 +298,7 @@ class PatchPerceiverAutoencoder(nn.Module):
         
         # Create patches: (batch, num_patches, num_channels, patch_len)
         patches = create_patches(signals, self.patch_len)
+        num_patches = patches.shape[1]  # Derive from actual patches, not hardcoded
         
         # Flatten to tokens: (batch, num_patches*num_channels, patch_len)
         flat_patches, modality_ids, channel_ids = flatten_patches(
@@ -297,15 +307,20 @@ class PatchPerceiverAutoencoder(nn.Module):
         
         num_tokens = flat_patches.shape[1]  # num_patches * num_channels
         
-        # Time embeddings for patch center times
+        # CRITICAL: Time embeddings must align with flat_patches ordering
+        # flat_patches ordering: [patch0_ch0, patch0_ch1, ..., patch0_chC, patch1_ch0, ...]
+        # So we need: [t0, t0, ..., t0 (C times), t1, t1, ..., t1 (C times), ...]
+        # 
         # Each patch covers [t_start, t_start + patch_len] samples
         # We use the center time: t_center = t_start + patch_len/2
-        patch_times = torch.arange(self.num_patches, device=device, dtype=torch.float32)
-        patch_times = (patch_times * self.patch_len + self.patch_len / 2) / self.sample_rate_hz
-        patch_times = patch_times.unsqueeze(0).unsqueeze(-1)  # (1, num_patches, 1)
+        t = (torch.arange(num_patches, device=device, dtype=torch.float32) * self.patch_len
+             + self.patch_len / 2.0) / self.sample_rate_hz  # (num_patches,)
         
-        # Expand for all channels: (batch, num_patches*num_channels, 1)
-        patch_times = patch_times.repeat(1, self.signal_dim, 1).reshape(batch, -1, 1)
+        t = t[None, :, None]                       # (1, num_patches, 1)
+        t = t.expand(batch, -1, -1)                # (batch, num_patches, 1)
+        t = t[:, :, None, :]                       # (batch, num_patches, 1, 1)
+        t = t.expand(-1, -1, self.signal_dim, -1)  # (batch, num_patches, C, 1)
+        patch_times = t.reshape(batch, num_patches * self.signal_dim, 1)  # (batch, num_tokens, 1)
         
         # Encode time with Fourier features
         # This converts scalar time t into rich representation: [t, sin(2π f₁ t), cos(2π f₁ t), ...]
@@ -325,14 +340,18 @@ class PatchPerceiverAutoencoder(nn.Module):
         # === MAE-style masking: remove masked tokens from encoder ===
         if patch_mask is not None and self.mask_strategy == 'mae':
             # Flatten mask: (batch, num_patches, signal_dim) -> (batch, num_tokens)
-            flat_mask = patch_mask.reshape(batch, -1)  # 1=visible, 0=masked
+            # Convention: 1=masked (reconstruct), 0=visible (use in encoder)
+            flat_mask = patch_mask.reshape(batch, -1)  # 1=masked, 0=visible
             
-            # Keep only visible tokens for encoder (saves compute!)
+            # Keep only VISIBLE tokens for encoder (saves compute!)
             # This is the key MAE insight: O(N_latents × M_visible) << O(N_latents × M_total)
             visible_tokens = []
             visible_indices = []
             for b in range(batch):
-                vis_idx = flat_mask[b].nonzero(as_tuple=True)[0]
+                vis_idx = (1 - flat_mask[b]).nonzero(as_tuple=True)[0]  # Find 0s (visible)
+                # CRITICAL: ensure at least 1 visible token to avoid attention crashes
+                if len(vis_idx) == 0:
+                    vis_idx = torch.tensor([0], device=device)  # Keep first token as fallback
                 visible_tokens.append(tokens[b, vis_idx])
                 visible_indices.append(vis_idx)
             
@@ -349,9 +368,9 @@ class PatchPerceiverAutoencoder(nn.Module):
         # === BERT-style masking: replace masked tokens with [MASK] ===
         elif patch_mask is not None and self.mask_strategy == 'bert':
             flat_mask = patch_mask.reshape(batch, -1).unsqueeze(-1)  # (batch, num_tokens, 1)
-            # Replace masked tokens with learnable [MASK] token
+            # Replace masked tokens (1s) with learnable [MASK] token
             mask_tokens = self.mask_token.expand(batch, num_tokens, -1)
-            encoder_tokens = tokens * flat_mask + mask_tokens * (1 - flat_mask)
+            encoder_tokens = tokens * (1 - flat_mask) + mask_tokens * flat_mask
             attention_mask = None  # All tokens attend
         
         # === No masking: standard autoencoding ===
@@ -378,9 +397,10 @@ class PatchPerceiverAutoencoder(nn.Module):
         decoded_patches = self.output_proj(decoded_tokens)  # (batch, num_tokens, patch_len)
         
         # Reshape back to (batch, num_patches, num_channels, patch_len)
-        decoded_patches = decoded_patches.reshape(batch, self.num_patches, self.signal_dim, self.patch_len)
+        decoded_patches = decoded_patches.reshape(batch, num_patches, self.signal_dim, self.patch_len)
         
         # Unpatchify: (batch, num_patches, num_channels, patch_len) -> (batch, seq_len, num_channels)
+        # Note: assumes non-overlapping patches (stride == patch_len)
         output = decoded_patches.permute(0, 2, 1, 3).reshape(batch, self.signal_dim, -1)
         output = output.transpose(1, 2)  # (batch, seq_len, num_channels)
         

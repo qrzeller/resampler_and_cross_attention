@@ -137,7 +137,7 @@ def train_epoch(
         # Generate patch-level mask using configured strategy
         if mask_config is not None:
             # Calculate number of patches
-            patch_len = model.patch_tokenizer.patch_len
+            patch_len = model.tokenizer.patch_len
             num_patches = seq_len // patch_len
             
             # Generate mask: (batch, num_patches, num_channels)
@@ -161,7 +161,7 @@ def train_epoch(
         recon = model(physio, patch_mask=patch_mask)
         
         # Pass patch_len for proper loss masking
-        patch_len = model.patch_tokenizer.patch_len if mask_config is not None else None
+        patch_len = model.tokenizer.patch_len if mask_config is not None else None
         loss, valid = masked_reconstruction_loss(
             recon, physio, mask=None, diff_weight=diff_weight, 
             modality_mask=patch_mask, patch_len=patch_len
@@ -217,7 +217,7 @@ def evaluate(
             # Generate patch-level mask using configured strategy
             if mask_config is not None:
                 # Calculate number of patches
-                patch_len = model.patch_tokenizer.patch_len
+                patch_len = model.tokenizer.patch_len
                 num_patches = seq_len // patch_len
                 
                 # Generate mask: (batch, num_patches, num_channels)
@@ -240,7 +240,7 @@ def evaluate(
             recon = model(physio, patch_mask=patch_mask)
             
             # Pass patch_len for proper loss masking
-            patch_len = model.patch_tokenizer.patch_len if mask_config is not None else None
+            patch_len = model.tokenizer.patch_len if mask_config is not None else None
             loss, valid = masked_reconstruction_loss(
                 recon, physio, mask=None, diff_weight=diff_weight,
                 modality_mask=patch_mask, patch_len=patch_len

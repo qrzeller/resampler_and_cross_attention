@@ -91,28 +91,29 @@ class PatchTokenizer(nn.Module):
         Tokenize patches with embeddings.
         
         Args:
-            patches: (batch, num_patches, patch_len) patch data
-            time_embeddings: (batch, num_patches, d_model) time position encodings
-            modality_ids: (batch, num_patches) modality indices [0, num_modalities)
-            channel_ids: (batch, num_patches) channel indices within modality
+            patches: (batch, num_tokens, patch_len) flattened patch data
+                    where num_tokens = num_patches * num_channels
+            time_embeddings: (batch, num_tokens, d_model) time position encodings
+            modality_ids: (batch, num_tokens) modality indices [0, num_modalities)
+            channel_ids: (batch, num_tokens) channel indices within modality
         
         Returns:
-            tokens: (batch, num_patches, d_model) tokenized representations
+            tokens: (batch, num_tokens, d_model) tokenized representations
         """
-        batch, num_patches, patch_len = patches.shape
+        batch, num_tokens, patch_len = patches.shape
         
         if self.use_conv_frontend:
-            # Reshape for Conv1d: (batch * num_patches, 1, patch_len)
+            # Reshape for Conv1d: (batch * num_tokens, 1, patch_len)
             patches_flat = patches.reshape(-1, 1, patch_len)
-            patch_features = self.patch_proj(patches_flat)  # (batch * num_patches, d_model)
-            patch_features = patch_features.reshape(batch, num_patches, self.d_model)
+            patch_features = self.patch_proj(patches_flat)  # (batch * num_tokens, d_model)
+            patch_features = patch_features.reshape(batch, num_tokens, self.d_model)
         else:
-            # Linear projection: (batch, num_patches, patch_len) -> (batch, num_patches, d_model)
+            # Linear projection: (batch, num_tokens, patch_len) -> (batch, num_tokens, d_model)
             patch_features = self.patch_proj(patches)
         
         # Add embeddings
-        modality_emb = self.modality_embedding(modality_ids)  # (batch, num_patches, d_model)
-        channel_emb = self.channel_embedding(channel_ids)    # (batch, num_patches, d_model)
+        modality_emb = self.modality_embedding(modality_ids)  # (batch, num_tokens, d_model)
+        channel_emb = self.channel_embedding(channel_ids)    # (batch, num_tokens, d_model)
         
         # Combine: token = proj(patch) + time_emb + modality_emb + channel_emb
         tokens = patch_features + time_embeddings + modality_emb + channel_emb
@@ -124,29 +125,27 @@ class PatchTokenizer(nn.Module):
 def create_patches(
     signals: torch.Tensor,
     patch_len: int,
-    stride: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Create overlapping or non-overlapping patches from signals.
+    Create non-overlapping patches from signals.
     
     Args:
         signals: (batch, seq_len, num_channels) input signals
-        patch_len: Length of each patch
-        stride: Stride between patches (default: same as patch_len for non-overlapping)
+        patch_len: Length of each patch (seq_len must be divisible by patch_len)
     
     Returns:
         patches: (batch, num_patches, num_channels, patch_len)
     """
-    if stride is None:
-        stride = patch_len
-    
     batch, seq_len, num_channels = signals.shape
     
+    # Enforce non-overlapping patches
+    assert seq_len % patch_len == 0, f"seq_len ({seq_len}) must be divisible by patch_len ({patch_len})"
+    
     # Calculate number of patches
-    num_patches = (seq_len - patch_len) // stride + 1
+    num_patches = seq_len // patch_len
     
     # Extract patches using unfold
-    patches = signals.transpose(1, 2).unfold(2, patch_len, stride)
+    patches = signals.transpose(1, 2).unfold(2, patch_len, patch_len)
     # patches: (batch, num_channels, num_patches, patch_len)
     
     # Rearrange to (batch, num_patches, num_channels, patch_len)
@@ -169,7 +168,7 @@ def flatten_patches(
     Returns:
         flat_patches: (batch, num_patches * num_channels, patch_len)
         modality_ids: (batch, num_patches * num_channels)
-        channel_ids: (batch, num_patches * num_channels)
+        channel_ids: (batch, num_patches * num_channels) - channel index within modality
     """
     batch, num_patches, num_channels, patch_len = patches.shape
     
@@ -185,7 +184,11 @@ def flatten_patches(
     modality_ids = modality_assignments.unsqueeze(0).unsqueeze(0).expand(batch, num_patches, -1)
     modality_ids = modality_ids.reshape(batch, -1)
     
-    # Create channel IDs (within modality) - simplified: assume 1 channel per modality
-    channel_ids = torch.zeros_like(modality_ids)
+    # Create channel IDs (actual channel indices 0..C-1)
+    # For multi-lead signals, this distinguishes leads within same modality
+    # Ordering: [ch0, ch1, ..., chC-1, ch0, ch1, ..., chC-1, ...] (repeated per patch)
+    channel_idx = torch.arange(num_channels, device=patches.device)  # (num_channels,)
+    channel_ids = channel_idx.unsqueeze(0).unsqueeze(0).expand(batch, num_patches, -1)  # (batch, num_patches, num_channels)
+    channel_ids = channel_ids.reshape(batch, -1)  # (batch, num_patches * num_channels)
     
     return flat_patches, modality_ids, channel_ids
