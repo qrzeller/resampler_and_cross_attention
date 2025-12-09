@@ -62,13 +62,15 @@ def plot_physio_reconstructions(
     *,
     sample_indices: Optional[Iterable[int]] = None,
     max_samples: int = 4,
+    mask_ratio: float = 0.75,
     save_path: str = "physio_recon.png",
     feature_names: Optional[Sequence[str]] = None,
 ) -> Path:
     """
-    Render ground-truth vs. reconstructed physio signals.
-
-    Useful for quick visual inspection of reconstruction quality.
+    Render ground-truth vs. reconstructed physio signals WITH patch masking.
+    
+    This shows the model's ability to reconstruct masked patches from visible context,
+    as it does during training. Masked regions are highlighted.
 
     Args:
         model: The model (should be in eval mode)
@@ -76,12 +78,15 @@ def plot_physio_reconstructions(
         device: Device to run inference on
         sample_indices: Specific indices to plot (optional)
         max_samples: Maximum number of samples to show
+        mask_ratio: Ratio of patches to mask (default: 0.75)
         save_path: Where to save the figure
         feature_names: Names for each channel (optional)
 
     Returns:
         Path to saved figure
     """
+    from masking import random_patch_mask
+    
     model.eval()
     indices = select_indices(len(dataset), sample_indices, max_samples)
 
@@ -100,16 +105,45 @@ def plot_physio_reconstructions(
     with torch.no_grad():
         for ax, idx in zip(axes, indices):
             sample = dataset[idx]
-            physio = sample["physio"].unsqueeze(0).to(device)
-            recon = model(physio).cpu().squeeze(0)
+            physio = sample["physio"].unsqueeze(0).to(device)  # (1, seq_len, channels)
+            
+            # Calculate number of patches
+            seq_len = physio.shape[1]
+            patch_len = model.patch_len
+            num_patches = seq_len // patch_len
+            
+            # Generate patch mask (1=masked, 0=visible)
+            patch_mask = random_patch_mask(
+                batch_size=1,
+                num_patches=num_patches,
+                num_channels=num_channels,
+                mask_ratio=mask_ratio,
+                device=device
+            )
+            
+            # Forward pass WITH masking
+            recon = model(physio, patch_mask=patch_mask).cpu().squeeze(0)
             target = physio.cpu().squeeze(0)
+            patch_mask_cpu = patch_mask.cpu().squeeze(0)  # (num_patches, num_channels)
 
             time = range(target.shape[0])
 
+            # First, highlight masked/visible regions for all channels
+            for patch_idx in range(num_patches):
+                start = patch_idx * patch_len
+                end = start + patch_len
+                # Check if this patch is masked for ANY channel
+                is_masked = patch_mask_cpu[patch_idx, :].any().item()
+                if is_masked:
+                    ax.axvspan(start, end, alpha=0.12, color='red', zorder=0)
+                else:
+                    ax.axvspan(start, end, alpha=0.08, color='green', zorder=0)
+            
+            # Then plot signals on top
             for feat in range(num_channels):
                 gt_label = f"{names[feat]} (gt)"
                 recon_label = f"{names[feat]} (recon)"
-                ax.plot(time, target[:, feat], label=gt_label, linewidth=1.5)
+                ax.plot(time, target[:, feat], label=gt_label, linewidth=1.5, alpha=0.7)
                 ax.plot(
                     time,
                     recon[:, feat],
@@ -123,7 +157,8 @@ def plot_physio_reconstructions(
             ax.set_ylabel("Signal value (normalized)")
             ax.legend(loc="best", fontsize=8)
             ax.grid(True, alpha=0.3)
-            ax.set_title(f"Sample {idx}: Ground-truth vs Reconstruction")
+            mask_percent = int(mask_ratio * 100)
+            ax.set_title(f"Sample {idx}: {mask_percent}% Patch Masked Reconstruction (red=masked, green=visible)")
 
     fig.tight_layout()
     save_path = Path(save_path)
