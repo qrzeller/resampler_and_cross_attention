@@ -1,32 +1,53 @@
-# Perceiver05: Masked Autoencoder with Learnable Mask Tokens
+# Perceiver06_bloc: Patch-based Masked Autoencoder for Physiological Signals
 
-A masked autoencoding implementation of Perceiver IO for multi-modal physiological signal reconstruction. This version introduces **learnable mask tokens** and **modality dropout** for robust cross-modal learning.
+A patch-based masked autoencoding implementation of Perceiver IO for multi-modal physiological signal reconstruction with proper signal preprocessing and PPG baseline preservation.
 
 ## Key Features
 
-### New in Perceiver05
-- **🎭 Learnable mask tokens**: Explicit embeddings replace dropped channels (vs zeros)
-- **🎲 Modality dropout**: Randomly drop entire physiological channels during training
-- **🔍 Masked loss computation**: Loss computed ONLY on dropped channels
-- **🔄 Smart residual handling**: Residual base uses masked input for proper reconstruction
-- **🧠 Cross-modal learning**: Model learns to infer missing modalities from available ones
+### Signal Processing
+- **🩺 PPG baseline preservation**: BVP split into baseline (vasomotor tone, perfusion) and pulsatile (pulse morphology) components
+- **🔬 Signal-specific preprocessing**: ECG band-pass, respiratory detrending, PPG baseline extraction
+- **📊 Robust normalization**: IQR-based normalization (more robust than z-score to artifacts)
+- **🎯 Physiologically meaningful**: Preserves DC/low-freq components that encode stress, autonomic state
 
-### Architecture Improvements
-- **Channel-aware masking**: Model knows which channels are masked vs naturally zero
-- **Fixed loss computation**: Prevents cheating by computing loss only on masked modalities
-- **Proper broadcasting**: Correct handling of channel-wise masks across time
-- **Skip empty batches**: Avoids training on batches where no channels are dropped
+### Architecture
+- **🧩 Patch-based tokenization**: 50 samples/patch (12 patches for 12-second windows @ 50Hz)
+- **🎭 Masked autoencoding**: MAE-style masking removes patches from encoder
+- **🔄 Proper Perceiver IO**: Pre-norm residuals, correct Fourier frequencies, runtime num_patches
+- **🧠 Cross-modal learning**: Model learns to infer missing patches from available context
+
+### Physiological Channels (6 total)
+1. **GSR**: Galvanic Skin Response (electrodermal activity)
+2. **ECG**: Electrocardiogram (band-pass filtered 0.5-40 Hz for clean QRS)
+3. **BVP_baseline**: PPG baseline component (vasomotor tone, perfusion, <0.05 Hz)
+4. **BVP_pulsatile**: PPG pulsatile component (heart rate morphology, >0.05 Hz)
+5. **Resp**: Respiration (baseline detrended to preserve breathing band)
+6. **Temp**: Temperature
 
 ## How It Works
 
-### Masked Autoencoding Process
+### PPG Baseline Preservation
 
-1. **Input**: 5 physiological channels `[ECG, GSR, BVP, TEMP, ACC]`
-2. **Modality dropout**: Randomly drop channels (e.g., `[ECG, 0, 0, TEMP, ACC]`)
-3. **Mask tokens**: Replace dropped channels with learnable embeddings
-4. **Encoder**: Build latent representation from available channels + mask tokens
-5. **Decoder**: Reconstruct ALL channels from latent space
-6. **Loss**: Compute reconstruction error ONLY on dropped channels (GSR, BVP)
+Traditional PPG preprocessing removes the baseline (DC/very-low-freq) via high-pass filtering, but this discards valuable physiological information:
+- **Vasomotor tone**: Sympathetic nervous system activity
+- **Perfusion**: Blood flow and tissue oxygenation
+- **Temperature/pressure effects**: Environmental and physiological state
+- **Stress markers**: Baseline changes correlate with stress responses
+
+**Solution**: Split BVP into two channels using lowpass filter (0.05 Hz cutoff):
+- `BVP_baseline = lowpass(BVP, 0.05 Hz)` - Slow physiological changes
+- `BVP_pulsatile = BVP - baseline` - Pulse morphology and heart rate
+
+This allows the model to learn from both components independently.
+
+### Patch-based Masked Autoencoding Process
+
+1. **Input**: 6 physiological channels `[GSR, ECG, BVP_baseline, BVP_pulsatile, Resp, Temp]`
+2. **Patch tokenization**: Split 600 samples into 12 patches of 50 samples each
+3. **Masking**: Randomly mask patches (e.g., 75% masking rate)
+4. **Encoder**: Process only visible (unmasked) patches with cross-attention
+5. **Decoder**: Reconstruct ALL patches from latent representation
+6. **Loss**: Compute reconstruction error ONLY on masked patches
 
 ### Why Mask Tokens?
 

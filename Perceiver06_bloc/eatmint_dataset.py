@@ -19,6 +19,127 @@ from torch.utils.data import Dataset
 
 
 # =============================================================================
+# Preprocessing Utilities
+# =============================================================================
+
+
+def baseline_detrend(
+    x: np.ndarray,
+    fs: float,
+    cutoff_hz: float = 0.05,
+    order: int = 4,
+) -> np.ndarray:
+    """
+    Remove baseline drift with high-pass filter.
+    
+    Preserves the actual physiological band while removing slow drift.
+    
+    Args:
+        x: Signal array (1D or 2D with time on axis 0)
+        fs: Sampling rate in Hz
+        cutoff_hz: High-pass cutoff frequency in Hz
+        order: Butterworth filter order
+    
+    Returns:
+        Detrended signal (same shape as input)
+    """
+    nyq = 0.5 * fs
+    cutoff_norm = cutoff_hz / nyq
+    
+    # Clamp to valid range
+    cutoff_norm = max(0.001, min(0.999, cutoff_norm))
+    
+    # Design high-pass Butterworth filter
+    sos = signal.butter(order, cutoff_norm, btype='highpass', output='sos')
+    
+    # Apply filter (handles 1D and 2D)
+    if x.ndim == 1:
+        return signal.sosfiltfilt(sos, x)
+    else:
+        # Filter each column independently
+        return np.column_stack([signal.sosfiltfilt(sos, x[:, i]) for i in range(x.shape[1])])
+
+
+def extract_ppg_baseline(
+    x: np.ndarray,
+    fs: float,
+    cutoff_hz: float = 0.05,
+    order: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Split PPG into baseline (DC/very-low-freq) and pulsatile (AC) components.
+    
+    PPG baseline encodes vasomotor tone, perfusion, temperature, pressure effects.
+    These are physiologically meaningful for stress, vasoconstriction, autonomic state.
+    
+    Args:
+        x: PPG signal (1D)
+        fs: Sampling rate in Hz
+        cutoff_hz: Lowpass cutoff for baseline extraction (typically 0.05 Hz)
+        order: Butterworth filter order
+    
+    Returns:
+        baseline: Very-low-frequency component (vasomotor tone, perfusion)
+        pulsatile: AC component (heart rate morphology, pulse dynamics)
+    """
+    nyq = 0.5 * fs
+    cutoff_norm = cutoff_hz / nyq
+    
+    # Clamp to valid range
+    cutoff_norm = max(0.001, min(0.999, cutoff_norm))
+    
+    # Design low-pass Butterworth filter for baseline extraction
+    sos = signal.butter(order, cutoff_norm, btype='lowpass', output='sos')
+    
+    # Extract baseline (DC/very-low-freq component)
+    baseline = signal.sosfiltfilt(sos, x)
+    
+    # Residual is pulsatile component (AC)
+    pulsatile = x - baseline
+    
+    return baseline, pulsatile
+
+
+def robust_normalize(
+    x: np.ndarray,
+    method: str = 'iqr',
+    axis: int = 0,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    Robust normalization using IQR or MAD.
+    
+    More robust to outliers/artifacts than standard z-score.
+    
+    Args:
+        x: Signal array
+        method: 'iqr' (interquartile range) or 'mad' (median absolute deviation)
+        axis: Axis along which to compute statistics
+        eps: Small constant to avoid division by zero
+    
+    Returns:
+        Normalized signal: (x - median) / scale
+    """
+    median = np.median(x, axis=axis, keepdims=True)
+    
+    if method == 'iqr':
+        # Interquartile range (Q3 - Q1)
+        q75 = np.percentile(x, 75, axis=axis, keepdims=True)
+        q25 = np.percentile(x, 25, axis=axis, keepdims=True)
+        scale = q75 - q25
+    elif method == 'mad':
+        # Median absolute deviation
+        scale = np.median(np.abs(x - median), axis=axis, keepdims=True)
+        # Scale factor to approximate std for normal distribution
+        scale = scale * 1.4826
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    scale = np.where(scale < eps, 1.0, scale)
+    return (x - median) / scale
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -149,8 +270,13 @@ def load_physio(
         if label.startswith(prefix):
             signal_name = label.split("-")[1]
             if signal_name in ["GSR1", "Temp", "Plet", "Resp"]:
-                # Map GSR1 -> GSR
-                key = "GSR" if signal_name == "GSR1" else signal_name
+                # Map GSR1 -> GSR, Plet -> BVP
+                if signal_name == "GSR1":
+                    key = "GSR"
+                elif signal_name == "Plet":
+                    key = "BVP"
+                else:
+                    key = signal_name
                 signals[key] = collab_data[:, i]
             elif signal_name == "EXG1":
                 exg1_idx = i
@@ -176,8 +302,22 @@ class EATMINTPhysioDataset(Dataset):
     """
     PyTorch Dataset for EATMINT physiological data.
 
-    Loads real physio signals (ECG, GSR, Resp, Temp, Plet) from .mat files,
-    applies z-score normalization, and segments into windows.
+    Loads real physio signals from .mat files, applies preprocessing, and segments into windows.
+    
+    Signal channels (6 total):
+    - GSR: Galvanic Skin Response (electrodermal activity)
+    - ECG: Electrocardiogram (band-pass filtered 0.5-40 Hz)
+    - BVP_baseline: PPG baseline component (vasomotor tone, perfusion, <0.05 Hz)
+    - BVP_pulsatile: PPG pulsatile component (heart rate morphology, >0.05 Hz)
+    - Resp: Respiration (baseline detrended)
+    - Temp: Temperature
+
+    Preprocessing pipeline:
+    1. BVP splitting: Extract baseline (lowpass <0.05Hz) and pulsatile (residual) components
+    2. ECG band-pass: Optional 0.5-40 Hz filter for clean QRS
+    3. Respiration detrend: Remove very-low-frequency drift (<0.03 Hz)
+    4. GSR/Temp detrend: Remove drift (<0.05 Hz) if detrend_non_ecg=True
+    5. Robust normalization: IQR-based per-signal normalization (more robust than z-score)
 
     Args:
         config: EATMINTConfig with data paths
@@ -188,11 +328,14 @@ class EATMINTPhysioDataset(Dataset):
         physio_fs: Native physio sampling rate (Hz)
         smoothing_kernel: Kernel size for post-downsampling smoothing
         downsample_strategy: "polyphase" or "avg"
+        ecg_band: Optional (low, high) band-pass for ECG in Hz
+        detrend_non_ecg: If True, remove DC from GSR/Temp/etc
         preload: Whether to preload all data into memory
     """
 
     # Physio signals to use (in order)
-    PHYSIO_SIGNALS = ["GSR", "ECG", "Resp", "Temp", "Plet"]
+    # Note: BVP (Plet) is split into baseline (vasomotor tone, perfusion) and pulsatile (pulse morphology)
+    PHYSIO_SIGNALS = ["GSR", "ECG", "BVP_baseline", "BVP_pulsatile", "Resp", "Temp"]
 
     def __init__(
         self,
@@ -306,10 +449,32 @@ class EATMINTPhysioDataset(Dataset):
 
         # Load physio signals
         physio = load_physio(self.config, dyad, participant)
+        fs = float(physio["fs"])
+        
+        # Build signal list in order specified by PHYSIO_SIGNALS
+        # Split BVP into baseline and pulsatile components during loading
         physio_signals = []
-
+        
         for sig in self.PHYSIO_SIGNALS:
-            if sig in physio:
+            if sig == "BVP_baseline":
+                # Extract baseline component from BVP
+                if "BVP" in physio:
+                    baseline, _ = extract_ppg_baseline(
+                        physio["BVP"], fs, cutoff_hz=0.05, order=4
+                    )
+                    physio_signals.append(baseline)
+                else:
+                    physio_signals.append(np.zeros(physio["n_samples"]))
+            elif sig == "BVP_pulsatile":
+                # Extract pulsatile component from BVP
+                if "BVP" in physio:
+                    _, pulsatile = extract_ppg_baseline(
+                        physio["BVP"], fs, cutoff_hz=0.05, order=4
+                    )
+                    physio_signals.append(pulsatile)
+                else:
+                    physio_signals.append(np.zeros(physio["n_samples"]))
+            elif sig in physio:
                 physio_signals.append(physio[sig])
             else:
                 # Fill with zeros if signal missing
@@ -318,34 +483,47 @@ class EATMINTPhysioDataset(Dataset):
         if not physio_signals:
             raise ValueError(f"No physio signals found for D{dyad}P{participant}")
 
+        # Stack all signals (including split BVP components)
         physio_data = np.stack(physio_signals, axis=1).astype(np.float32)
-
-        # Optional preprocessing: ECG band-pass + detrend other channels
-        fs = float(physio["fs"])
-        # ECG is channel index 1 in PHYSIO_SIGNALS
+        
+        # Signal-specific preprocessing
+        # ECG (channel 1): Band-pass filter 0.5-40 Hz for clean QRS
         ecg_idx = self.PHYSIO_SIGNALS.index("ECG") if "ECG" in self.PHYSIO_SIGNALS else None
-
+        
+        # Respiration: Low-frequency baseline detrend
+        resp_idx = self.PHYSIO_SIGNALS.index("Resp") if "Resp" in self.PHYSIO_SIGNALS else None
+        
+        # Apply ECG band-pass if specified
         if ecg_idx is not None and self.ecg_band is not None:
             low, high = self.ecg_band
-            # Clamp to valid range and design a Butterworth band-pass
             nyq = 0.5 * fs
             low = max(0.001, float(low) / nyq)
             high = min(0.999, float(high) / nyq)
             if low < high:
-                b, a = signal.butter(4, [low, high], btype="bandpass")
-                physio_data[:, ecg_idx] = signal.filtfilt(b, a, physio_data[:, ecg_idx])
-
+                sos = signal.butter(4, [low, high], btype="bandpass", output='sos')
+                physio_data[:, ecg_idx] = signal.sosfiltfilt(sos, physio_data[:, ecg_idx])
+        
+        # Respiration baseline detrend: Very low cutoff (0.02-0.05 Hz)
+        # Preserves breathing band (~0.1-0.5 Hz) while removing slow drift
+        if resp_idx is not None:
+            physio_data[:, resp_idx] = baseline_detrend(
+                physio_data[:, resp_idx], fs, cutoff_hz=0.03, order=4
+            )
+        
+        # General detrend for other channels (GSR, Temp)
+        # BVP_baseline/pulsatile already split, ECG/Resp already filtered
         if self.detrend_non_ecg:
             for ch_idx, sig_name in enumerate(self.PHYSIO_SIGNALS):
-                if sig_name == "ECG":
-                    continue
-                physio_data[:, ch_idx] = signal.detrend(physio_data[:, ch_idx], type="constant")
-
-        # Z-score normalize each channel (after filtering/detrend)
-        physio_mean = np.mean(physio_data, axis=0, keepdims=True)
-        physio_std = np.std(physio_data, axis=0, keepdims=True)
-        physio_std = np.where(physio_std < 1e-8, 1.0, physio_std)
-        physio_data = (physio_data - physio_mean) / physio_std
+                if sig_name in ["ECG", "BVP_baseline", "BVP_pulsatile", "Resp"]:
+                    continue  # Already processed
+                # Use moderate cutoff for general signals (GSR, Temp)
+                physio_data[:, ch_idx] = baseline_detrend(
+                    physio_data[:, ch_idx], fs, cutoff_hz=0.05, order=4
+                )
+        
+        # Robust normalization: (x - median) / IQR
+        # More robust to motion artifacts than standard z-score
+        physio_data = robust_normalize(physio_data, method='iqr', axis=0)
 
         # Create timestamps (physio is synced to collab start/stop)
         physio_ts = np.linspace(0, collab_duration, len(physio_data))
