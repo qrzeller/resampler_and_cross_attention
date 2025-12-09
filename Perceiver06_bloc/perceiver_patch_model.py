@@ -177,7 +177,7 @@ class PatchPerceiverAutoencoder(nn.Module):
         num_latents: int = 128,
         num_self_attn_layers: int = 8,
         num_heads: int = 8,
-        num_modalities: int = 5,
+        num_modalities: int = 6,
         max_channels_per_modality: int = 1,
         use_conv_frontend: bool = False,
         num_fourier_bands: int = 32,

@@ -112,8 +112,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-signals",
         type=int,
-        default=5,
-        help="Number of signal channels (default: 5)",
+        default=6,
+        help="Number of signal channels (default: 6 for EATMINT: GSR, ECG, BVP_baseline, BVP_pulsatile, Resp, Temp)",
     )
     parser.add_argument(
         "--preload",
