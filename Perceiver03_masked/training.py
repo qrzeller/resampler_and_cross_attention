@@ -169,7 +169,7 @@ def evaluate(
             if mask is not None:
                 mask = mask.to(device, non_blocking=True)
 
-            recon = model(physio)
+            recon = model(physio, mask=mask)
             loss, valid = masked_reconstruction_loss(
                 recon, physio, mask=mask, diff_weight=diff_weight
             )

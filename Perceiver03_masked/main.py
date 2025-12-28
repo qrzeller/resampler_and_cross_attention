@@ -453,6 +453,56 @@ def main() -> None:
     else:
         train_ds, val_ds = dataset, None
 
+    # Freeze validation masks so val metric is stable across epochs
+    if args.masking and val_ds is not None:
+        import numpy as _np
+        from torch.utils.data import Dataset as _DS
+
+        class FixedMaskWrapper(_DS):
+            def __init__(self, base_ds, mask_frac):
+                self.base = base_ds
+                self.mask_frac = float(mask_frac)
+                self.cache = {}
+
+            def __len__(self):
+                return len(self.base)
+
+            def _create_mask(self, phys):
+                seq_len = phys.shape[0]
+                channels = phys.shape[1]
+                mask = _np.zeros((seq_len, channels), dtype=bool)
+                for ch in range(channels):
+                    clen = max(1, int(round(seq_len * self.mask_frac)))
+                    if clen >= seq_len:
+                        s = 0
+                    else:
+                        s = _np.random.randint(0, seq_len - clen + 1)
+                    mask[s : s + clen, ch] = True
+                return torch.from_numpy(mask)
+
+            def __getitem__(self, idx):
+                item = self.base[idx]
+                phys = item["physio"] if isinstance(item, dict) else item
+
+                if idx not in self.cache:
+                    if isinstance(item, dict) and "mask" in item:
+                        self.cache[idx] = item["mask"].clone().detach()
+                    else:
+                        self.cache[idx] = self._create_mask(phys)
+
+                mask = self.cache[idx]
+                if isinstance(item, dict):
+                    out = dict(item)
+                    out["mask"] = mask
+                    return out
+                return {"physio": phys, "mask": mask}
+
+            @property
+            def window_samples(self):
+                return getattr(self.base, "window_samples", None)
+
+        val_ds = FixedMaskWrapper(val_ds, args.mask_frac)
+
     # If cached windows were moved to GPU, do not use pin_memory and avoid workers
     worker_count = args.num_workers
     pin_memory_flag = (device.type == "cuda")
