@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 
@@ -101,26 +102,53 @@ def plot_physio_reconstructions(
         for ax, idx in zip(axes, indices):
             sample = dataset[idx]
             physio = sample["physio"].unsqueeze(0).to(device)
-            recon = model(physio).cpu().squeeze(0)
+            mask = sample.get("mask")
+            if mask is not None:
+                mask = mask.unsqueeze(0).to(device)
+
+            recon = model(physio, mask=mask).cpu().squeeze(0)
             target = physio.cpu().squeeze(0)
 
-            time = range(target.shape[0])
+            # Only show model output on masked positions; elsewhere show ground truth
+            if mask is not None:
+                mask_bool = mask.squeeze(0).cpu().bool()
+                recon_display = target.clone()
+                recon_display[mask_bool] = recon[mask_bool]
+            else:
+                mask_bool = None
+                recon_display = recon
+
+            time = np.arange(target.shape[0])
 
             for feat in range(num_channels):
                 gt_label = f"{names[feat]} (gt)"
-                recon_label = f"{names[feat]} (recon)"
+                recon_label = f"{names[feat]} (recon masked)" if mask is not None else f"{names[feat]} (recon)"
                 ax.plot(time, target[:, feat], label=gt_label, linewidth=1.5)
                 ax.plot(
                     time,
-                    recon[:, feat],
+                    recon_display[:, feat],
                     linestyle="--",
                     label=recon_label,
                     linewidth=1.2,
-                    alpha=0.8,
+                    alpha=0.9,
                 )
 
+            # Shade masked regions (any channel masked)
+            if mask_bool is not None:
+                masked_any = mask_bool.any(dim=1).numpy()
+                # find contiguous masked spans
+                in_span = False
+                start = 0
+                for i, m in enumerate(masked_any.tolist() + [False]):
+                    if m and not in_span:
+                        start = i
+                        in_span = True
+                    elif in_span and not m:
+                        ax.axvspan(start, i, color="gray", alpha=0.12)
+                        in_span = False
+
             ax.set_xlabel("Sample index")
-            ax.set_ylabel("Signal value (normalized)")
+            ax.set_ylabel("Signal value")
             ax.legend(loc="best", fontsize=8)
             ax.grid(True, alpha=0.3)
             ax.set_title(f"Sample {idx}: Ground-truth vs Reconstruction")
